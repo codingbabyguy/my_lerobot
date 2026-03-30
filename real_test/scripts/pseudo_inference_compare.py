@@ -52,6 +52,7 @@ def _select_indices(
     chunk_size: int,
     global_start: int | None,
     chunk_stride: int,
+    prediction_offset: int,
 ) -> tuple[list[int], int]:
     if episode_index is not None and global_start is not None:
         raise ValueError("--episode-index 和 --global-start 不能同时设置")
@@ -73,10 +74,12 @@ def _select_indices(
     chunk_size = max(1, int(chunk_size))
     chunk_stride = max(1, int(chunk_stride))
     num_chunks = max(1, int(num_chunks))
+    prediction_offset = max(0, int(prediction_offset))
+    required_span = prediction_offset + chunk_size
 
     starts: list[int] = []
     cursor = start
-    while len(starts) < num_chunks and (cursor + chunk_size) <= end_limit:
+    while len(starts) < num_chunks and (cursor + required_span) <= end_limit:
         starts.append(cursor)
         cursor += chunk_stride
 
@@ -222,10 +225,10 @@ def _plot_action_compare(
 def _plot_global_branch_compare(
     out_path: Path,
     action_names: list[str],
-    step_ids: np.ndarray,
-    gt: np.ndarray,
+    backbone_steps: np.ndarray,
+    backbone_gt: np.ndarray,
     chunk_starts: list[int],
-    chunk_size: int,
+    target_steps_chunk: np.ndarray,
     pred_chunk: np.ndarray,
 ) -> None:
     """
@@ -238,32 +241,33 @@ def _plot_global_branch_compare(
     fig, axes = plt.subplots(rows, cols, figsize=(18, 14), sharex=True)
     axes = axes.flatten()
 
-    # 若出现重叠 step（例如 stride < chunk_size），对 GT 先按 step 聚合平均，保证主线连续。
-    uniq_steps = np.unique(step_ids)
-    gt_unique = np.zeros((len(uniq_steps), gt.shape[1]), dtype=np.float64)
-    for k, s in enumerate(uniq_steps):
-        mask = step_ids == s
-        gt_unique[k] = np.mean(gt[mask], axis=0)
+    start_pos = {int(step): idx for idx, step in enumerate(backbone_steps.tolist())}
 
     for i, name in enumerate(action_names):
         ax = axes[i]
-        ax.plot(uniq_steps, gt_unique[:, i], color="#1f77b4", linewidth=2.2, label="gt")
+        ax.plot(backbone_steps, backbone_gt[:, i], color="#1f77b4", linewidth=2.2, label="gt")
 
-        start_vals = []
+        start_x = []
+        start_y = []
         for cidx, start in enumerate(chunk_starts):
-            x_seg = np.arange(start, start + chunk_size, dtype=np.int64)
-            y_seg = pred_chunk[cidx, :, i]
-            ax.plot(x_seg, y_seg, color="#ff7f0e", linewidth=1.35, alpha=0.52)
+            pos = start_pos.get(int(start))
+            if pos is None:
+                continue
 
-            # 起点点位取 GT 主线上对应值，确保“从 GT 点生长出来”的视觉语义。
-            pos = np.where(uniq_steps == start)[0]
-            if len(pos) > 0:
-                start_vals.append(gt_unique[pos[0], i])
+            gt_start = float(backbone_gt[pos, i])
+            branch_x = np.concatenate(
+                [np.asarray([start], dtype=np.int64), target_steps_chunk[cidx].astype(np.int64)]
+            )
+            branch_y = np.concatenate([np.asarray([gt_start], dtype=np.float64), pred_chunk[cidx, :, i]])
 
-        if len(start_vals) > 0:
+            ax.plot(branch_x, branch_y, color="#ff7f0e", linewidth=1.35, alpha=0.52)
+            start_x.append(int(start))
+            start_y.append(gt_start)
+
+        if start_x:
             ax.scatter(
-                np.asarray(chunk_starts, dtype=np.int64),
-                np.asarray(start_vals, dtype=np.float64),
+                np.asarray(start_x, dtype=np.int64),
+                np.asarray(start_y, dtype=np.float64),
                 s=18,
                 color="#1f77b4",
                 edgecolors="black",
@@ -432,7 +436,18 @@ def main() -> None:
     parser.add_argument("--global-start", type=int, default=None, help="全局数据索引起点")
     parser.add_argument("--num-chunks", type=int, default=25, help="chunk 数量")
     parser.add_argument("--chunk-size", type=int, default=0, help="每个 chunk 的步数，0 表示使用模型 n_action_steps")
-    parser.add_argument("--chunk-stride", type=int, default=0, help="chunk 起点步长，0 表示等于 chunk-size")
+    parser.add_argument(
+        "--prediction-offset",
+        type=int,
+        default=1,
+        help="预测目标相对起点的偏移，1 表示起点帧作为输入，预测后续 chunk-size 帧",
+    )
+    parser.add_argument(
+        "--chunk-stride",
+        type=int,
+        default=0,
+        help="chunk 起点步长，0 表示等于 prediction-offset + chunk-size",
+    )
     parser.add_argument("--num-arm-snapshots", type=int, default=6, help="简化机械臂快照数量")
     parser.add_argument(
         "--output-dir",
@@ -464,7 +479,8 @@ def main() -> None:
 
     default_chunk_size = int(getattr(policy_cfg, "n_action_steps", 8))
     chunk_size = int(args.chunk_size) if int(args.chunk_size) > 0 else default_chunk_size
-    chunk_stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else chunk_size
+    prediction_offset = max(0, int(args.prediction_offset))
+    chunk_stride = int(args.chunk_stride) if int(args.chunk_stride) > 0 else (prediction_offset + chunk_size)
     start_step = int(args.start_offset) if args.start_offset is not None else int(args.start_step)
 
     policy = make_policy(policy_cfg, ds_meta=dataset.meta)
@@ -490,6 +506,7 @@ def main() -> None:
         chunk_size=chunk_size,
         global_start=args.global_start,
         chunk_stride=chunk_stride,
+        prediction_offset=prediction_offset,
     )
 
     if len(chunk_starts) < int(args.num_chunks):
@@ -508,10 +525,12 @@ def main() -> None:
     print(
         "[INFO] chunk_mode="
         f"true, chunk_size={chunk_size}, chunk_stride={chunk_stride}, "
+        f"prediction_offset={prediction_offset}, "
         f"num_chunks={len(chunk_starts)}, total_steps={sample_count}"
     )
 
     safe_device = get_safe_torch_device(policy.config.device)
+    chunk_target_steps: list[np.ndarray] = []
     for cidx, start_idx in enumerate(chunk_starts):
         row0 = hf[start_idx]
         obs0 = _build_observation(row0)
@@ -537,8 +556,15 @@ def main() -> None:
             pred = np.array([pred_dict[n] for n in action_names], dtype=np.float64)
             pred_chunk.append(pred)
 
+        target_steps = np.arange(
+            start_idx + prediction_offset,
+            start_idx + prediction_offset + chunk_size,
+            dtype=np.int64,
+        )
+        chunk_target_steps.append(target_steps)
+
         for inner in range(chunk_size):
-            idx = start_idx + inner
+            idx = int(target_steps[inner])
             gt = np.asarray(hf[idx]["action"], dtype=np.float64)
             pred = pred_chunk[inner]
 
@@ -581,13 +607,21 @@ def main() -> None:
         step_arr = np.asarray(step_ids, dtype=np.int64)
         gt_chunk = gt_arr.reshape(len(chunk_starts), chunk_size, -1)
         pred_chunk = pred_arr.reshape(len(chunk_starts), chunk_size, -1)
+        target_steps_chunk = np.stack(chunk_target_steps, axis=0)
+        backbone_start = int(chunk_starts[0])
+        backbone_end = int(target_steps_chunk[-1, -1]) + 1
+        backbone_steps = np.arange(backbone_start, backbone_end, dtype=np.int64)
+        backbone_gt = np.stack(
+            [np.asarray(hf[int(idx)]["action"], dtype=np.float64) for idx in backbone_steps],
+            axis=0,
+        )
         _plot_global_branch_compare(
             out_dir / "compare_actions_global.png",
             action_names,
-            step_arr,
-            gt_arr,
+            backbone_steps,
+            backbone_gt,
             chunk_starts,
-            chunk_size,
+            target_steps_chunk,
             pred_chunk,
         )
         _plot_chunk_action_compare(
