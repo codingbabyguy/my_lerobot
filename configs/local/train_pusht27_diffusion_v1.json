@@ -1,0 +1,42 @@
+{
+  "dataset": {
+    "repo_id": "icrlab/pushT_batch8",
+    "root": "/home/icrlab/tactile_work_Wy/data/pushT-1.p-20/batch_8/lerobot_v3",
+    "use_imagenet_stats": true,
+    "streaming": false
+  },
+  "policy": {
+    "type": "diffusion",
+    "device": "cuda",
+    "use_amp": true,
+    "push_to_hub": false,
+    "n_obs_steps": 2,
+    "horizon": 16,
+    "n_action_steps": 8,
+    "vision_backbone": "resnet18",
+    "crop_is_random": true,
+    "noise_scheduler_type": "DDPM",
+    "num_train_timesteps": 100,
+    "optimizer_lr": 0.0001,
+    "scheduler_name": "cosine",
+    "scheduler_warmup_steps": 500
+  },
+  "output_dir": "/home/icrlab/tactile_work_Wy/lerobot/outputs/train/pusht27_diffusion_v1",
+  "job_name": "pusht27_diffusion_v1",
+  "resume": false,
+  "seed": 42,
+  "cudnn_deterministic": false,
+  "num_workers": 4,
+  "batch_size": 8,
+  "steps": 15000,
+  "eval_freq": 0,
+  "log_freq": 50,
+  "save_checkpoint": true,
+  "save_freq": 1000,
+  "use_policy_training_preset": true,
+  "wandb": {
+    "enable": false,
+    "project": "lerobot"
+  },
+  "rename_map": {}
+}

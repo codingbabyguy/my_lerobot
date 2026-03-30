@@ -1,0 +1,106 @@
+{
+  "project": {
+    "name": "pusht27_diffusion_v2_real_test",
+    "date": "2026-03-28"
+  },
+  "dataset": {
+    "repo_id": "icrlab/pushT_batch8",
+    "root": "/home/icrlab/tactile_work_Wy/data/pushT-1.p-20/batch_8/lerobot_v3",
+    "meta_info_path": "/home/icrlab/tactile_work_Wy/data/pushT-1.p-20/batch_8/lerobot_v3/meta/info.json",
+    "meta_stats_path": "/home/icrlab/tactile_work_Wy/data/pushT-1.p-20/batch_8/lerobot_v3/meta/stats.json"
+  },
+  "checkpoint": {
+    "pretrained_model_path": "/home/icrlab/tactile_work_Wy/lerobot/outputs/train/pusht27_diffusion_v2/checkpoints/015000/pretrained_model"
+  },
+  "control": {
+    "target_hz": 10,
+    "execution_mode": "serial",
+    "action_wait_timeout_s": 3.0,
+    "keyboard_enabled": true,
+    "max_steps": 0,
+    "latency_log_csv": "/home/icrlab/tactile_work_Wy/lerobot/real_test/results/realtime_latency.csv",
+    "action_log_csv": "/home/icrlab/tactile_work_Wy/lerobot/real_test/results/realtime_actions.csv"
+  },
+  "estop": {
+    "enabled": true,
+    "trigger_file": "/tmp/lerobot_estop"
+  },
+  "action_schema": {
+    "names": [
+      "x",
+      "y",
+      "z",
+      "rot6d_0",
+      "rot6d_1",
+      "rot6d_2",
+      "rot6d_3",
+      "rot6d_4",
+      "rot6d_5",
+      "gripper"
+    ],
+    "coordinate_frame": "robot_base",
+    "position_unit": "meter",
+    "rotation_representation": "rot6d",
+    "gripper_unit": "normalized"
+  },
+  "safety": {
+    "action_bounds": {
+      "x": [-4.2027388, 4.0596399],
+      "y": [-2.3737893, 0.9288814],
+      "z": [-1.4731338, 2.4369891],
+      "rot6d_0": [0.2057904, 0.5266764],
+      "rot6d_1": [0.6536872, 0.9631264],
+      "rot6d_2": [-0.6750259, 0.3406557],
+      "rot6d_3": [-0.8663338, -0.5604165],
+      "rot6d_4": [0.0350166, 0.6995494],
+      "rot6d_5": [0.1244797, 0.7743064],
+      "gripper": [0.0, 1.0]
+    },
+    "workspace_bounds": {
+      "x": [-0.35, 0.35],
+      "y": [-0.25, 0.25],
+      "z": [0.08, 0.40]
+    },
+    "max_xyz_speed_mps": 0.12,
+    "max_rot_delta_rad": 0.10,
+    "max_gripper_delta_per_step": 0.07
+  },
+  "offline_replay": {
+    "num_segments": 20,
+    "segment_length": 30,
+    "parquet_path": "/home/icrlab/tactile_work_Wy/data/pushT-1.p-20/batch_8/lerobot_v3/data/chunk-000/file-000.parquet",
+    "output_dir": "/home/icrlab/tactile_work_Wy/lerobot/real_test/results/offline"
+  },
+  "real_test_protocol": {
+    "empty_load_rounds": 10,
+    "simplified_task_rounds": 10,
+    "log_jsonl": "/home/icrlab/tactile_work_Wy/lerobot/real_test/results/real_test_protocol.jsonl"
+  },
+  "robot_adapter": {
+    "name": "german_arm",
+    "dry_run": true,
+    "config": {
+      "sdk_src_path": "/home/icrlab/tactile_work_Wy/RM_API2/Demo/RMDemo_Python/RMDemo_SimpleProcess/src",
+      "host": "192.168.1.18",
+      "port": 8080,
+      "level": 3,
+      "thread_mode": 2,
+      "run_mode": 1,
+      "timeout_ms": 500,
+      "movep_canfd_speed": 50,
+      "movep_canfd_follow": false,
+      "movep_canfd_trajectory_mode": 0,
+      "movep_canfd_radio": 0,
+      "gripper_min": 1,
+      "gripper_max": 1000,
+      "gripper_block": false,
+      "gripper_timeout_s": 0,
+      "completion_poll_dt_s": 0.02,
+      "completion_pose_tol_m": 0.005,
+      "completion_rot_tol_rad": 0.08,
+      "camera_index": 0,
+      "image_shape": [224, 224, 3],
+      "initial_gripper": 1.0
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "num_steps": 24,
+  "total_ms": {
+    "mean": 62.814958333333344,
+    "p95": 364.3818,
+    "p99": 562.3548099999999,
+    "max": 621.431
+  },
+  "infer_ms": {
+    "mean": 57.32233333333334,
+    "p95": 359.0319,
+    "p99": 560.7588699999999,
+    "max": 620.957
+  },
+  "loop_hz": {
+    "mean": 9.046041666666667,
+    "p05": 2.7445,
+    "p95": 10.0,
+    "min": 1.609
+  },
+  "overrun": {
+    "count": 3,
+    "ratio": 0.125
+  },
+  "wait_ms": {
+    "mean": 4.868416666666667,
+    "p95": 5.142449999999999,
+    "max": 5.193
+  },
+  "action_completion": {
+    "success_ratio": 1.0,
+    "timeout_count": 0
+  },
+  "key_events": {},
+  "camera_source": {
+    "placeholder": 24
+  },
+  "safety_events": {
+    "workspace:x": 24,
+    "workspace:z": 24,
+    "xyz_speed_limit": 17,
+    "workspace:y": 10,
+    "clip:rot6d_0": 4,
+    "clip:rot6d_5": 1,
+    "rot_delta_limit": 1
+  }
+}
