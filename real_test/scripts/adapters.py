@@ -141,6 +141,61 @@ def _get_cv2_api_id(cv2_module: Any, api_name: str | None) -> int:
     return int(api_map[api_name])
 
 
+def _infer_camera_index(camera_device_path: str | None) -> int | None:
+    if not camera_device_path:
+        return None
+    path = Path(str(camera_device_path))
+    name = path.name
+    if name.startswith("video") and name[5:].isdigit():
+        return int(name[5:])
+    try:
+        resolved = path.resolve()
+    except Exception:
+        return None
+    resolved_name = resolved.name
+    if resolved_name.startswith("video") and resolved_name[5:].isdigit():
+        return int(resolved_name[5:])
+    return None
+
+
+def _open_camera(
+    cv2_module: Any,
+    camera_api: int,
+    camera_device_path: str | None = None,
+    camera_index: int | None = None,
+):
+    attempts: list[tuple[Any, int, str]] = []
+
+    if camera_device_path is not None:
+        attempts.append((str(camera_device_path), camera_api, f"path:{camera_device_path}"))
+        if camera_api != getattr(cv2_module, "CAP_ANY", 0):
+            attempts.append((str(camera_device_path), getattr(cv2_module, "CAP_ANY", 0), f"path:{camera_device_path}:any"))
+
+        inferred_index = _infer_camera_index(camera_device_path)
+        if inferred_index is not None:
+            attempts.append((int(inferred_index), camera_api, f"index:{inferred_index}"))
+            if camera_api != getattr(cv2_module, "CAP_ANY", 0):
+                attempts.append((int(inferred_index), getattr(cv2_module, "CAP_ANY", 0), f"index:{inferred_index}:any"))
+
+    if camera_index is not None:
+        attempts.append((int(camera_index), camera_api, f"index:{camera_index}"))
+        if camera_api != getattr(cv2_module, "CAP_ANY", 0):
+            attempts.append((int(camera_index), getattr(cv2_module, "CAP_ANY", 0), f"index:{camera_index}:any"))
+
+    seen: set[tuple[str, int]] = set()
+    for source, api, source_desc in attempts:
+        dedupe_key = (str(source), int(api))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        cap = cv2_module.VideoCapture(source, api)
+        if cap.isOpened():
+            return cap, source_desc
+        cap.release()
+
+    return None, "placeholder"
+
+
 def _apply_image_transform(
     frame_bgr: np.ndarray,
     cv2_module: Any,
@@ -280,10 +335,16 @@ class GermanArmAdapter(BaseRobotAdapter):
             try:
                 cv2 = importlib.import_module("cv2")
                 camera_api = _get_cv2_api_id(cv2, self.robot_cfg.get("camera_api", "auto"))
-                if camera_device_path is not None:
-                    cap = cv2.VideoCapture(str(camera_device_path), camera_api)
-                else:
-                    cap = cv2.VideoCapture(int(camera_index), camera_api)
+                cap, source_desc = _open_camera(
+                    cv2_module=cv2,
+                    camera_api=camera_api,
+                    camera_device_path=camera_device_path,
+                    camera_index=camera_index,
+                )
+
+                if cap is None:
+                    self._camera_source = "placeholder"
+                    return
 
                 capture_resolution = self.robot_cfg.get("camera_resolution")
                 if capture_resolution is not None and len(capture_resolution) >= 2:
@@ -306,7 +367,7 @@ class GermanArmAdapter(BaseRobotAdapter):
                 if cap.isOpened():
                     self._camera = cap
                     self._cv2 = cv2
-                    self._camera_source = "camera"
+                    self._camera_source = f"camera:{source_desc}"
                 else:
                     cap.release()
                     self._camera_source = "placeholder"

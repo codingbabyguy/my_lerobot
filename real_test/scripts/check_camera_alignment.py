@@ -17,7 +17,7 @@ if str(SRC_DIR) not in sys.path:
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from adapters import _apply_image_transform, _get_cv2_api_id
+from adapters import _apply_image_transform, _get_cv2_api_id, _open_camera
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
@@ -94,12 +94,14 @@ def main() -> None:
     camera_api = _get_cv2_api_id(cv2, robot_cfg.get("camera_api", "auto"))
     camera_device_path = robot_cfg.get("camera_device_path")
     camera_index = robot_cfg.get("camera_index")
-    if camera_device_path is not None:
-        cap = cv2.VideoCapture(str(camera_device_path), camera_api)
-    else:
-        cap = cv2.VideoCapture(int(camera_index), camera_api)
+    cap, source_desc = _open_camera(
+        cv2_module=cv2,
+        camera_api=camera_api,
+        camera_device_path=camera_device_path,
+        camera_index=camera_index,
+    )
 
-    if not cap.isOpened():
+    if cap is None or not cap.isOpened():
         raise RuntimeError("Failed to open camera. Check camera_device_path / camera_index and camera_api.")
 
     capture_resolution = robot_cfg.get("camera_resolution")
@@ -161,6 +163,7 @@ def main() -> None:
     print(f"saved: {processed_path}")
     print(f"saved: {dataset_path}")
     print(f"saved: {compare_path}")
+    print(f"camera_source: {source_desc}")
     print(f"dataset_index: {dataset_idx}")
     print(f"dataset_episode_index: {row.get('episode_index')}")
     print(f"dataset_frame_index: {row.get('frame_index')}")
