@@ -54,9 +54,24 @@
 - `robot_adapter.config.completion_pose_tol_m`
 - `robot_adapter.config.completion_rot_tol_rad`
 
-### 2.5 相机输入（可选）
+### 2.5 相机输入（建议真机必须）
 
-- `robot_adapter.config.camera_index`: 填相机编号（如 `0`）
+推荐 GoPro 通过 HDMI 采集卡接入 Linux，使用稳定设备路径而不是裸 `camera_index`：
+
+- `robot_adapter.config.camera_api`: 推荐 `v4l2`
+- `robot_adapter.config.camera_device_path`: 推荐填 `/dev/v4l/by-id/...video-index0`
+- `robot_adapter.config.camera_resolution`: 例如 `[1920, 1080]`
+- `robot_adapter.config.camera_fps`: 例如 `30`
+- `robot_adapter.config.camera_buffer_size`: 建议 `1` 或 `2`
+- `robot_adapter.config.camera_fourcc`: 常用 `MJPG`
+- `robot_adapter.config.camera_rotation_deg`: 若 GoPro 画面方向不对，可设 `90/180/270`
+- `robot_adapter.config.camera_flip_horizontal` / `camera_flip_vertical`: 视安装方向调整
+- `robot_adapter.config.camera_crop_ratio`: 额外中心裁剪比例；若实时视野比训练更“宽”，可尝试 `0.85`、`0.75`、`0.65`
+- `robot_adapter.config.image_shape`: 送入策略前的最终尺寸，当前脚本会按 Dual-exumi 风格“保持宽高比缩放 + 中心裁剪 + resize”
+
+兼容保留：
+
+- `robot_adapter.config.camera_index`: 普通 USB 摄像头可继续使用
 - 不配置或打开失败时会自动回退为占位黑图，不阻塞推理
 
 ### 2.6 安全边界（真机前必须收紧）
@@ -91,6 +106,31 @@ cd /home/icrlab/tactile_work_Wy/lerobot
 - `cv2` 用于相机读取。
 - `matplotlib` 用于生成 `realtime_dashboard.png`。
 - 没有 `matplotlib` 时仍会输出 `realtime_summary.json`。
+
+如果是 GoPro + 采集卡，先在服务器上查稳定设备路径：
+
+```bash
+cd /home/icrlab/tactile_work_Wy/lerobot
+python real_test/scripts/list_v4l_cameras.py
+```
+
+优先使用 `/dev/v4l/by-id/...` 输出里的 `video-index0` 路径填写到 `camera_device_path`。
+
+相机对齐检查：
+
+```bash
+cd /home/icrlab/tactile_work_Wy/lerobot
+/home/icrlab/miniforge3/envs/lerobot/bin/python real_test/scripts/check_camera_alignment.py \
+  --config real_test/config/deployment_config.json \
+  --dataset-index 0
+```
+
+输出目录：
+
+- `real_test/results/camera_check/live_raw.png`
+- `real_test/results/camera_check/live_processed.png`
+- `real_test/results/camera_check/dataset_reference.png`
+- `real_test/results/camera_check/compare_side_by_side.png`
 
 ## 4. 推荐运行顺序（从稳到真机）
 
@@ -250,7 +290,10 @@ cd /home/icrlab/tactile_work_Wy/lerobot
 
 请检查：
 
-- `camera_index` 是否正确
+- `camera_device_path` 是否存在且可读
+- `camera_api` 是否设置为 `v4l2`
+- `camera_resolution / camera_fps / camera_fourcc` 是否是采集卡支持的组合
+- 若使用普通 USB 相机，再检查 `camera_index` 是否正确
 - 当前环境是否可导入 `cv2`
 - 相机是否被其他进程占用
 

@@ -55,6 +55,16 @@ config.gripper_*	夹爪映射和控制参数	按夹爪实测标定
 config.completion_poll_dt_s	完成判定轮询周期	0.02~0.05
 config.completion_pose_tol_m	到位位置容差	实机可适当放宽
 config.completion_rot_tol_rad	到位姿态容差	实机可适当放宽
-config.camera_index	本机相机索引	接服务器后按实际编号
-config.image_shape	送入策略的图像尺寸	要与训练预处理匹配
+config.camera_api	相机接口后端	GoPro/采集卡推荐 v4l2
+config.camera_device_path	稳定视频设备路径	优先用 /dev/v4l/by-id/...video-index0
+config.camera_index	本机相机索引	普通 USB 摄像头可用；有 device_path 时可忽略
+config.camera_resolution	采集分辨率	建议和 GoPro/采集卡输出一致
+config.camera_fps	采集帧率	建议和任务频率成整数倍
+config.camera_buffer_size	OpenCV 采集缓冲	建议 1~2
+config.camera_fourcc	采集格式	常用 MJPG
+config.camera_rotation_deg	画面旋转	0/90/180/270
+config.camera_flip_horizontal	水平翻转	按实际安装方向
+config.camera_flip_vertical	垂直翻转	按实际安装方向
+config.camera_crop_ratio	额外中心裁剪比例	默认 1.0；若想更贴近训练视野可试 0.65~0.85
+config.image_shape	送入策略的图像尺寸	代码会先保宽高比缩放并中心裁剪，再 resize 到该尺寸
 config.initial_gripper	初始夹爪归一化值	按任务初态设置

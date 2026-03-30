@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import abc
-import importlib
 import math
+import importlib
 import sys
 import time
 from pathlib import Path
@@ -128,6 +128,86 @@ def _euler_xyz_to_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
     return rz_m @ ry_m @ rx_m
 
 
+def _get_cv2_api_id(cv2_module: Any, api_name: str | None) -> int:
+    api_name = str(api_name or "auto").strip().lower()
+    api_map = {
+        "auto": getattr(cv2_module, "CAP_ANY", 0),
+        "any": getattr(cv2_module, "CAP_ANY", 0),
+        "opencv": getattr(cv2_module, "CAP_ANY", 0),
+        "v4l2": getattr(cv2_module, "CAP_V4L2", getattr(cv2_module, "CAP_ANY", 0)),
+    }
+    if api_name not in api_map:
+        raise ValueError(f"Unsupported camera_api: {api_name}")
+    return int(api_map[api_name])
+
+
+def _apply_image_transform(
+    frame_bgr: np.ndarray,
+    cv2_module: Any,
+    output_hw: tuple[int, int],
+    rotation_deg: int = 0,
+    flip_horizontal: bool = False,
+    flip_vertical: bool = False,
+    crop_ratio: float = 1.0,
+) -> np.ndarray:
+    frame = frame_bgr
+
+    rotation_deg = int(rotation_deg) % 360
+    rotate_map = {
+        0: None,
+        90: cv2_module.ROTATE_90_CLOCKWISE,
+        180: cv2_module.ROTATE_180,
+        270: cv2_module.ROTATE_90_COUNTERCLOCKWISE,
+    }
+    if rotation_deg not in rotate_map:
+        raise ValueError("camera_rotation_deg must be one of 0/90/180/270")
+    rotate_code = rotate_map[rotation_deg]
+    if rotate_code is not None:
+        frame = cv2_module.rotate(frame, rotate_code)
+
+    if flip_horizontal:
+        frame = cv2_module.flip(frame, 1)
+    if flip_vertical:
+        frame = cv2_module.flip(frame, 0)
+
+    frame = cv2_module.cvtColor(frame, cv2_module.COLOR_BGR2RGB)
+
+    out_h, out_w = output_hw
+    in_h, in_w = frame.shape[:2]
+    if in_h <= 0 or in_w <= 0:
+        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
+
+    crop_ratio = float(crop_ratio)
+    if 0.0 < crop_ratio < 1.0:
+        target_ratio = out_w / float(out_h)
+        crop_h = max(1, min(int(round(in_h * crop_ratio)), in_h))
+        crop_w = max(1, int(round(crop_h * target_ratio)))
+        if crop_w > in_w:
+            crop_w = in_w
+            crop_h = max(1, min(int(round(crop_w / target_ratio)), in_h))
+
+        x0 = max((in_w - crop_w) // 2, 0)
+        y0 = max((in_h - crop_h) // 2, 0)
+        frame = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
+        interp = cv2_module.INTER_LINEAR if (crop_w < out_w or crop_h < out_h) else cv2_module.INTER_AREA
+        frame = cv2_module.resize(frame, (out_w, out_h), interpolation=interp)
+        return frame.astype(np.uint8, copy=False)
+
+    # Match Dual-exumi's behavior: resize while keeping aspect ratio, then center crop.
+    scale = max(out_w / float(in_w), out_h / float(in_h))
+    resize_w = max(int(math.ceil(in_w * scale)), out_w)
+    resize_h = max(int(math.ceil(in_h * scale)), out_h)
+    interp = cv2_module.INTER_LINEAR if scale > 1.0 else cv2_module.INTER_AREA
+    frame = cv2_module.resize(frame, (resize_w, resize_h), interpolation=interp)
+
+    x0 = max((resize_w - out_w) // 2, 0)
+    y0 = max((resize_h - out_h) // 2, 0)
+    frame = frame[y0 : y0 + out_h, x0 : x0 + out_w]
+    if frame.shape[0] != out_h or frame.shape[1] != out_w:
+        frame = cv2_module.resize(frame, (out_w, out_h), interpolation=cv2_module.INTER_LINEAR)
+    return frame.astype(np.uint8, copy=False)
+
+
 class GermanArmAdapter(BaseRobotAdapter):
     """Realman (睿尔曼) adapter for the real_test pipeline."""
 
@@ -143,6 +223,7 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._last_target_pose: np.ndarray | None = None
         self._camera = None
         self._camera_source = "placeholder"
+        self._cv2 = None
 
     def _load_rm_sdk(self) -> None:
         if self._rm_module_loaded:
@@ -193,11 +274,35 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._robot = robot
         self.connected = True
 
+        camera_device_path = self.robot_cfg.get("camera_device_path")
         camera_index = self.robot_cfg.get("camera_index")
-        if camera_index is not None:
+        if camera_device_path is not None or camera_index is not None:
             try:
                 cv2 = importlib.import_module("cv2")
-                cap = cv2.VideoCapture(int(camera_index))
+                camera_api = _get_cv2_api_id(cv2, self.robot_cfg.get("camera_api", "auto"))
+                if camera_device_path is not None:
+                    cap = cv2.VideoCapture(str(camera_device_path), camera_api)
+                else:
+                    cap = cv2.VideoCapture(int(camera_index), camera_api)
+
+                capture_resolution = self.robot_cfg.get("camera_resolution")
+                if capture_resolution is not None and len(capture_resolution) >= 2:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(capture_resolution[0]))
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(capture_resolution[1]))
+
+                camera_fps = self.robot_cfg.get("camera_fps")
+                if camera_fps is not None:
+                    cap.set(cv2.CAP_PROP_FPS, float(camera_fps))
+
+                camera_buffer_size = self.robot_cfg.get("camera_buffer_size")
+                if camera_buffer_size is not None:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, int(camera_buffer_size))
+
+                camera_fourcc = self.robot_cfg.get("camera_fourcc")
+                if camera_fourcc:
+                    fourcc = cv2.VideoWriter_fourcc(*str(camera_fourcc)[:4])
+                    cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+
                 if cap.isOpened():
                     self._camera = cap
                     self._cv2 = cv2
@@ -218,7 +323,7 @@ class GermanArmAdapter(BaseRobotAdapter):
         self.connected = False
 
     def _capture_image(self) -> np.ndarray:
-        if self._camera is None:
+        if self._camera is None or self._cv2 is None:
             return np.zeros(self._image_shape, dtype=np.uint8)
 
         ok, frame = self._camera.read()
@@ -226,9 +331,19 @@ class GermanArmAdapter(BaseRobotAdapter):
             return np.zeros(self._image_shape, dtype=np.uint8)
 
         img_h, img_w, _ = self._image_shape
-        frame = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
-        frame = self._cv2.resize(frame, (img_w, img_h), interpolation=self._cv2.INTER_LINEAR)
-        return frame.astype(np.uint8)
+        rotation_deg = int(self.robot_cfg.get("camera_rotation_deg", 0))
+        flip_horizontal = bool(self.robot_cfg.get("camera_flip_horizontal", False))
+        flip_vertical = bool(self.robot_cfg.get("camera_flip_vertical", False))
+        crop_ratio = float(self.robot_cfg.get("camera_crop_ratio", 1.0))
+        return _apply_image_transform(
+            frame_bgr=frame,
+            cv2_module=self._cv2,
+            output_hw=(img_h, img_w),
+            rotation_deg=rotation_deg,
+            flip_horizontal=flip_horizontal,
+            flip_vertical=flip_vertical,
+            crop_ratio=crop_ratio,
+        )
 
     def get_observation(self) -> dict[str, np.ndarray]:
         if not self.connected or self._robot is None:
