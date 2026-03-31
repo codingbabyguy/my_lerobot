@@ -196,6 +196,35 @@ def _open_camera(
     return None, "placeholder"
 
 
+def _configure_camera_for_uvc(cap: Any, cv2_module: Any, camera_cfg: dict[str, Any]) -> None:
+    capture_resolution = camera_cfg.get("camera_resolution")
+    if capture_resolution is not None and len(capture_resolution) >= 2:
+        cap.set(cv2_module.CAP_PROP_FRAME_WIDTH, int(capture_resolution[0]))
+        cap.set(cv2_module.CAP_PROP_FRAME_HEIGHT, int(capture_resolution[1]))
+
+    camera_buffer_size = camera_cfg.get("camera_buffer_size")
+    if camera_buffer_size is not None:
+        cap.set(cv2_module.CAP_PROP_BUFFERSIZE, int(camera_buffer_size))
+
+    camera_fps = camera_cfg.get("camera_fps")
+    if camera_fps is not None:
+        cap.set(cv2_module.CAP_PROP_FPS, float(camera_fps))
+
+
+def _capture_camera_frame(cap: Any, cv2_module: Any, warmup_grabs: int = 1) -> np.ndarray | None:
+    # exUMI uses grab/retrieve for UVC capture cards, which is often more stable than read().
+    warmup_grabs = max(int(warmup_grabs), 1)
+    frame = None
+    for _ in range(warmup_grabs):
+        ok = cap.grab()
+        if not ok:
+            return None
+        ok, frame = cap.retrieve(frame)
+        if not ok or frame is None:
+            return None
+    return frame
+
+
 def _apply_image_transform(
     frame_bgr: np.ndarray,
     cv2_module: Any,
@@ -335,6 +364,7 @@ class GermanArmAdapter(BaseRobotAdapter):
             try:
                 cv2 = importlib.import_module("cv2")
                 camera_api = _get_cv2_api_id(cv2, self.robot_cfg.get("camera_api", "auto"))
+                cv2.setNumThreads(1)
                 cap, source_desc = _open_camera(
                     cv2_module=cv2,
                     camera_api=camera_api,
@@ -346,23 +376,7 @@ class GermanArmAdapter(BaseRobotAdapter):
                     self._camera_source = "placeholder"
                     return
 
-                capture_resolution = self.robot_cfg.get("camera_resolution")
-                if capture_resolution is not None and len(capture_resolution) >= 2:
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(capture_resolution[0]))
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(capture_resolution[1]))
-
-                camera_fps = self.robot_cfg.get("camera_fps")
-                if camera_fps is not None:
-                    cap.set(cv2.CAP_PROP_FPS, float(camera_fps))
-
-                camera_buffer_size = self.robot_cfg.get("camera_buffer_size")
-                if camera_buffer_size is not None:
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, int(camera_buffer_size))
-
-                camera_fourcc = self.robot_cfg.get("camera_fourcc")
-                if camera_fourcc:
-                    fourcc = cv2.VideoWriter_fourcc(*str(camera_fourcc)[:4])
-                    cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+                _configure_camera_for_uvc(cap, cv2, self.robot_cfg)
 
                 if cap.isOpened():
                     self._camera = cap
@@ -387,8 +401,8 @@ class GermanArmAdapter(BaseRobotAdapter):
         if self._camera is None or self._cv2 is None:
             return np.zeros(self._image_shape, dtype=np.uint8)
 
-        ok, frame = self._camera.read()
-        if not ok or frame is None:
+        frame = _capture_camera_frame(self._camera, self._cv2)
+        if frame is None:
             return np.zeros(self._image_shape, dtype=np.uint8)
 
         img_h, img_w, _ = self._image_shape

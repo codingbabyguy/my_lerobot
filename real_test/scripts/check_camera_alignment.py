@@ -17,7 +17,7 @@ if str(SRC_DIR) not in sys.path:
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from adapters import _apply_image_transform, _get_cv2_api_id, _open_camera
+from adapters import _apply_image_transform, _capture_camera_frame, _configure_camera_for_uvc, _get_cv2_api_id, _open_camera
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
@@ -90,6 +90,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    cv2.setNumThreads(1)
 
     camera_api = _get_cv2_api_id(cv2, robot_cfg.get("camera_api", "auto"))
     camera_device_path = robot_cfg.get("camera_device_path")
@@ -104,32 +105,15 @@ def main() -> None:
     if cap is None or not cap.isOpened():
         raise RuntimeError("Failed to open camera. Check camera_device_path / camera_index and camera_api.")
 
-    capture_resolution = robot_cfg.get("camera_resolution")
-    if capture_resolution is not None and len(capture_resolution) >= 2:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(capture_resolution[0]))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(capture_resolution[1]))
-
-    camera_fps = robot_cfg.get("camera_fps")
-    if camera_fps is not None:
-        cap.set(cv2.CAP_PROP_FPS, float(camera_fps))
-
-    camera_buffer_size = robot_cfg.get("camera_buffer_size")
-    if camera_buffer_size is not None:
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, int(camera_buffer_size))
-
-    camera_fourcc = robot_cfg.get("camera_fourcc")
-    if camera_fourcc:
-        fourcc = cv2.VideoWriter_fourcc(*str(camera_fourcc)[:4])
-        cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+    _configure_camera_for_uvc(cap, cv2, robot_cfg)
 
     try:
-        ok = False
         frame = None
         for _ in range(15):
-            ok, frame = cap.read()
-            if ok and frame is not None:
+            frame = _capture_camera_frame(cap, cv2)
+            if frame is not None:
                 break
-        if not ok or frame is None:
+        if frame is None:
             raise RuntimeError("Camera opened but failed to read a frame.")
     finally:
         cap.release()
