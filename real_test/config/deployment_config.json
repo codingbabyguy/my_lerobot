@@ -15,9 +15,9 @@
   "control": {
     "target_hz": 10,
     "execution_mode": "serial",
-    "action_wait_timeout_s": 3.0,
+    "action_wait_timeout_s": 1.0,
     "keyboard_enabled": true,
-    "max_steps": 0,
+    "max_steps": 5,
     "latency_log_csv": "/home/icrlab/tactile_work_Wy/lerobot/real_test/results/realtime_latency.csv",
     "action_log_csv": "/home/icrlab/tactile_work_Wy/lerobot/real_test/results/realtime_actions.csv"
   },
@@ -61,9 +61,9 @@
       "y": [-0.25, 0.25],
       "z": [0.08, 0.40]
     },
-    "max_xyz_speed_mps": 0.12,
-    "max_rot_delta_rad": 0.10,
-    "max_gripper_delta_per_step": 0.07
+    "max_xyz_speed_mps": 0.02,
+    "max_rot_delta_rad": 0.03,
+    "max_gripper_delta_per_step": 0.0
   },
   "offline_replay": {
     "num_segments": 20,
