@@ -55,7 +55,11 @@ config.gripper_*	夹爪映射和控制参数	按夹爪实测标定
 config.completion_poll_dt_s	完成判定轮询周期	0.02~0.05
 config.completion_pose_tol_m	到位位置容差	实机可适当放宽
 config.completion_rot_tol_rad	到位姿态容差	实机可适当放宽
-config.camera_api	相机接口后端	GoPro/采集卡推荐 v4l2
+config.manual_origin	采集标定参考系原点	来自 calibration_params.npz
+config.manual_rotation	采集标定参考系旋转矩阵	来自 calibration_params.npz
+config.xyz_mean	训练时相对位置 Z-score 均值	来自 convert_session_to_lerobot_dp.py 输出
+config.xyz_std	训练时相对位置 Z-score 标准差	来自 convert_session_to_lerobot_dp.py 输出
+config.camera_api	相机接口后端	按当前 OpenCV 构建选择；你这台机器更建议 auto
 config.camera_device_path	稳定视频设备路径	优先用 /dev/v4l/by-id/...video-index0
 config.camera_index	本机相机索引	普通 USB 摄像头可用；有 device_path 时可忽略
 config.camera_resolution	采集分辨率	建议和 GoPro/采集卡输出一致

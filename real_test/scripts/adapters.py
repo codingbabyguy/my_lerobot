@@ -128,6 +128,28 @@ def _euler_xyz_to_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
     return rz_m @ ry_m @ rx_m
 
 
+def _as_float_vector(value: Any, length: int, default: list[float] | None = None) -> np.ndarray:
+    if value is None:
+        if default is None:
+            raise ValueError(f"Expected a vector of length {length}")
+        value = default
+    arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    if arr.shape[0] != length:
+        raise ValueError(f"Expected vector length {length}, got {arr.shape[0]}")
+    return arr
+
+
+def _as_float_matrix(value: Any, shape: tuple[int, int], default: list[list[float]] | None = None) -> np.ndarray:
+    if value is None:
+        if default is None:
+            raise ValueError(f"Expected matrix shape {shape}")
+        value = default
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.shape != shape:
+        raise ValueError(f"Expected matrix shape {shape}, got {arr.shape}")
+    return arr
+
+
 def _get_cv2_api_id(cv2_module: Any, api_name: str | None) -> int:
     api_name = str(api_name or "auto").strip().lower()
     api_map = {
@@ -329,6 +351,15 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._camera = None
         self._camera_source = "placeholder"
         self._cv2 = None
+        self._manual_origin = _as_float_vector(robot_cfg.get("manual_origin"), 3, default=[0.0, 0.0, 0.0])
+        self._manual_rotation = _as_float_matrix(
+            robot_cfg.get("manual_rotation"),
+            (3, 3),
+            default=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        )
+        self._xyz_mean = _as_float_vector(robot_cfg.get("xyz_mean"), 3, default=[0.0, 0.0, 0.0])
+        self._xyz_std = _as_float_vector(robot_cfg.get("xyz_std"), 3, default=[1.0, 1.0, 1.0])
+        self._xyz_std = np.maximum(self._xyz_std, 1e-6)
 
     def _load_rm_sdk(self) -> None:
         if self._rm_module_loaded:
@@ -449,6 +480,18 @@ class GermanArmAdapter(BaseRobotAdapter):
             crop_ratio=crop_ratio,
         )
 
+    def _world_to_policy_pose(self, pos_world: np.ndarray, rot_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        pos_rel = self._manual_rotation.T @ (pos_world - self._manual_origin)
+        rot_rel = self._manual_rotation.T @ rot_world
+        pos_norm = (pos_rel - self._xyz_mean) / self._xyz_std
+        return pos_norm, rot_rel
+
+    def _policy_to_world_pose(self, pos_policy: np.ndarray, rot_policy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        pos_rel = pos_policy * self._xyz_std + self._xyz_mean
+        pos_world = self._manual_rotation @ pos_rel + self._manual_origin
+        rot_world = self._manual_rotation @ rot_policy
+        return pos_world, rot_world
+
     def get_observation(self) -> dict[str, np.ndarray]:
         if not self.connected or self._robot is None:
             raise RuntimeError("GermanArmAdapter is not connected")
@@ -460,12 +503,11 @@ class GermanArmAdapter(BaseRobotAdapter):
         pose = state.get("pose", [0.0, 0.0, 0.2, 0.0, 0.0, 0.0])
         x, y, z, rx, ry, rz = [float(v) for v in pose]
         rot_m = _euler_xyz_to_matrix(rx, ry, rz)
-        rot6d = matrix_to_rot6d(rot_m)
+        pos_policy, rot_policy = self._world_to_policy_pose(np.array([x, y, z], dtype=np.float64), rot_m)
+        rot6d = matrix_to_rot6d(rot_policy)
 
         obs_state = np.zeros(10, dtype=np.float32)
-        obs_state[0] = np.float32(x)
-        obs_state[1] = np.float32(y)
-        obs_state[2] = np.float32(z)
+        obs_state[0:3] = pos_policy.astype(np.float32)
         obs_state[3:9] = rot6d.astype(np.float32)
         obs_state[9] = np.float32(self._last_gripper)
 
@@ -480,13 +522,15 @@ class GermanArmAdapter(BaseRobotAdapter):
             raise RuntimeError("GermanArmAdapter is not connected")
 
         rot6d = np.array([action[f"rot6d_{i}"] for i in range(6)], dtype=np.float64)
-        rot_m = rot6d_to_matrix(rot6d)
-        euler = _matrix_to_euler_xyz(rot_m)
+        rot_policy = rot6d_to_matrix(rot6d)
+        pos_policy = np.array([action["x"], action["y"], action["z"]], dtype=np.float64)
+        pos_world, rot_world = self._policy_to_world_pose(pos_policy, rot_policy)
+        euler = _matrix_to_euler_xyz(rot_world)
 
         pose = [
-            float(action["x"]),
-            float(action["y"]),
-            float(action["z"]),
+            float(pos_world[0]),
+            float(pos_world[1]),
+            float(pos_world[2]),
             float(euler[0]),
             float(euler[1]),
             float(euler[2]),
