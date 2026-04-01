@@ -56,10 +56,12 @@ def main() -> None:
         euler_world = pose[3:]
         rot_world = _euler_xyz_to_matrix(*euler_world.tolist())
 
-        manual_origin = adapter._manual_origin
-        manual_rotation = adapter._manual_rotation
-        rel_pos = manual_rotation.T @ (pos_world - manual_origin)
-        rel_rot = manual_rotation.T @ rot_world
+        ref_pos = adapter._reference_pos_world
+        ref_rot = adapter._reference_rot_world
+        if ref_pos is None or ref_rot is None:
+            raise RuntimeError("Reference pose is not initialized")
+        rel_pos = ref_rot.T @ (pos_world - ref_pos)
+        rel_rot = ref_rot.T @ rot_world
         pos_norm = (rel_pos - adapter._xyz_mean) / adapter._xyz_std
         rot6d = matrix_to_rot6d(rel_rot)
 
@@ -68,14 +70,14 @@ def main() -> None:
         np.set_printoptions(precision=6, suppress=True)
         print("camera_source =", adapter.camera_source())
         print("raw_pose_world =", pose.tolist())
-        print("manual_origin =", manual_origin.tolist())
-        print("manual_rotation =")
-        print(manual_rotation)
+        print("reference_pos_world =", ref_pos.tolist())
+        print("reference_rot_world =")
+        print(ref_rot)
         print("xyz_mean =", adapter._xyz_mean.tolist())
         print("xyz_std =", adapter._xyz_std.tolist())
-        print("rel_pos_manual =", rel_pos.tolist())
+        print("rel_pos_reference =", rel_pos.tolist())
         print("pos_norm =", pos_norm.tolist())
-        print("rot6d_manual =", rot6d.tolist())
+        print("rot6d_reference =", rot6d.tolist())
         print("observation.state =", obs["observation.state"].tolist())
         print("image_mean =", float(obs["observation.image"].mean()))
     finally:

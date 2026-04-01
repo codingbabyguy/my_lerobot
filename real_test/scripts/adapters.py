@@ -351,15 +351,11 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._camera = None
         self._camera_source = "placeholder"
         self._cv2 = None
-        self._manual_origin = _as_float_vector(robot_cfg.get("manual_origin"), 3, default=[0.0, 0.0, 0.0])
-        self._manual_rotation = _as_float_matrix(
-            robot_cfg.get("manual_rotation"),
-            (3, 3),
-            default=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-        )
         self._xyz_mean = _as_float_vector(robot_cfg.get("xyz_mean"), 3, default=[0.0, 0.0, 0.0])
         self._xyz_std = _as_float_vector(robot_cfg.get("xyz_std"), 3, default=[1.0, 1.0, 1.0])
         self._xyz_std = np.maximum(self._xyz_std, 1e-6)
+        self._reference_pos_world: np.ndarray | None = None
+        self._reference_rot_world: np.ndarray | None = None
 
     def _load_rm_sdk(self) -> None:
         if self._rm_module_loaded:
@@ -410,6 +406,15 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._robot = robot
         self.connected = True
 
+        ret, state = self._robot.rm_get_current_arm_state()
+        if ret != 0:
+            raise RuntimeError(f"rm_get_current_arm_state failed during reference capture: code {ret}")
+        pose = state.get("pose", [0.0, 0.0, 0.2, 0.0, 0.0, 0.0])
+        x, y, z, rx, ry, rz = [float(v) for v in pose]
+        self._reference_pos_world = np.array([x, y, z], dtype=np.float64)
+        self._reference_rot_world = _euler_xyz_to_matrix(rx, ry, rz)
+        self._last_target_pose = np.array([x, y, z, rx, ry, rz], dtype=np.float64)
+
         camera_device_path = self.robot_cfg.get("camera_device_path")
         camera_index = self.robot_cfg.get("camera_index")
         if camera_device_path is not None or camera_index is not None:
@@ -444,6 +449,8 @@ class GermanArmAdapter(BaseRobotAdapter):
         if self._camera is not None:
             self._camera.release()
             self._camera = None
+        self._reference_pos_world = None
+        self._reference_rot_world = None
         if not self.connected or self._robot is None:
             return
         self._robot.rm_delete_robot_arm()
@@ -481,15 +488,19 @@ class GermanArmAdapter(BaseRobotAdapter):
         )
 
     def _world_to_policy_pose(self, pos_world: np.ndarray, rot_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        pos_rel = self._manual_rotation.T @ (pos_world - self._manual_origin)
-        rot_rel = self._manual_rotation.T @ rot_world
+        if self._reference_pos_world is None or self._reference_rot_world is None:
+            raise RuntimeError("Reference pose is not initialized")
+        pos_rel = self._reference_rot_world.T @ (pos_world - self._reference_pos_world)
+        rot_rel = self._reference_rot_world.T @ rot_world
         pos_norm = (pos_rel - self._xyz_mean) / self._xyz_std
         return pos_norm, rot_rel
 
     def _policy_to_world_pose(self, pos_policy: np.ndarray, rot_policy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if self._reference_pos_world is None or self._reference_rot_world is None:
+            raise RuntimeError("Reference pose is not initialized")
         pos_rel = pos_policy * self._xyz_std + self._xyz_mean
-        pos_world = self._manual_rotation @ pos_rel + self._manual_origin
-        rot_world = self._manual_rotation @ rot_policy
+        pos_world = self._reference_pos_world + self._reference_rot_world @ pos_rel
+        rot_world = self._reference_rot_world @ rot_policy
         return pos_world, rot_world
 
     def get_observation(self) -> dict[str, np.ndarray]:
