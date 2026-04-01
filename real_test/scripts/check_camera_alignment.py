@@ -127,6 +127,10 @@ def main() -> None:
         rotation_deg=int(robot_cfg.get("camera_rotation_deg", 0)),
         flip_horizontal=bool(robot_cfg.get("camera_flip_horizontal", False)),
         flip_vertical=bool(robot_cfg.get("camera_flip_vertical", False)),
+        trim_left=float(robot_cfg.get("camera_trim_left", 0.0)),
+        trim_right=float(robot_cfg.get("camera_trim_right", 0.0)),
+        trim_top=float(robot_cfg.get("camera_trim_top", 0.0)),
+        trim_bottom=float(robot_cfg.get("camera_trim_bottom", 0.0)),
         crop_ratio=float(robot_cfg.get("camera_crop_ratio", 1.0)),
     )
 

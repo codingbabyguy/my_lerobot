@@ -232,6 +232,10 @@ def _apply_image_transform(
     rotation_deg: int = 0,
     flip_horizontal: bool = False,
     flip_vertical: bool = False,
+    trim_left: float = 0.0,
+    trim_right: float = 0.0,
+    trim_top: float = 0.0,
+    trim_bottom: float = 0.0,
     crop_ratio: float = 1.0,
 ) -> np.ndarray:
     frame = frame_bgr
@@ -253,6 +257,23 @@ def _apply_image_transform(
         frame = cv2_module.flip(frame, 1)
     if flip_vertical:
         frame = cv2_module.flip(frame, 0)
+
+    in_h, in_w = frame.shape[:2]
+    trim_left = float(trim_left)
+    trim_right = float(trim_right)
+    trim_top = float(trim_top)
+    trim_bottom = float(trim_bottom)
+    trim_values = [trim_left, trim_right, trim_top, trim_bottom]
+    if any(v < 0.0 or v >= 0.5 for v in trim_values):
+        raise ValueError("camera_trim_* must be in [0.0, 0.5)")
+
+    x0 = int(round(in_w * trim_left))
+    x1 = in_w - int(round(in_w * trim_right))
+    y0 = int(round(in_h * trim_top))
+    y1 = in_h - int(round(in_h * trim_bottom))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        raise ValueError("camera_trim_* removed too much of the image")
+    frame = frame[y0:y1, x0:x1]
 
     frame = cv2_module.cvtColor(frame, cv2_module.COLOR_BGR2RGB)
 
@@ -409,6 +430,10 @@ class GermanArmAdapter(BaseRobotAdapter):
         rotation_deg = int(self.robot_cfg.get("camera_rotation_deg", 0))
         flip_horizontal = bool(self.robot_cfg.get("camera_flip_horizontal", False))
         flip_vertical = bool(self.robot_cfg.get("camera_flip_vertical", False))
+        trim_left = float(self.robot_cfg.get("camera_trim_left", 0.0))
+        trim_right = float(self.robot_cfg.get("camera_trim_right", 0.0))
+        trim_top = float(self.robot_cfg.get("camera_trim_top", 0.0))
+        trim_bottom = float(self.robot_cfg.get("camera_trim_bottom", 0.0))
         crop_ratio = float(self.robot_cfg.get("camera_crop_ratio", 1.0))
         return _apply_image_transform(
             frame_bgr=frame,
@@ -417,6 +442,10 @@ class GermanArmAdapter(BaseRobotAdapter):
             rotation_deg=rotation_deg,
             flip_horizontal=flip_horizontal,
             flip_vertical=flip_vertical,
+            trim_left=trim_left,
+            trim_right=trim_right,
+            trim_top=trim_top,
+            trim_bottom=trim_bottom,
             crop_ratio=crop_ratio,
         )
 

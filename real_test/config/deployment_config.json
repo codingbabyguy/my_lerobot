@@ -108,6 +108,10 @@
       "camera_rotation_deg": 0,
       "camera_flip_horizontal": false,
       "camera_flip_vertical": false,
+      "camera_trim_left": 0.0,
+      "camera_trim_right": 0.0,
+      "camera_trim_top": 0.0,
+      "camera_trim_bottom": 0.0,
       "camera_crop_ratio": 1.0,
       "image_shape": [224, 224, 3],
       "initial_gripper": 1.0
