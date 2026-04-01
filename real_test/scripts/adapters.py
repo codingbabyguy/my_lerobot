@@ -358,6 +358,63 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._reference_rot_world: np.ndarray | None = None
         self._workspace_bounds_world = robot_cfg.get("workspace_bounds_world", {})
 
+    def _connect_camera(self) -> None:
+        camera_device_path = self.robot_cfg.get("camera_device_path")
+        camera_index = self.robot_cfg.get("camera_index")
+        if camera_device_path is None and camera_index is None:
+            self._camera_source = "placeholder"
+            return
+
+        cv2 = importlib.import_module("cv2")
+        camera_api = _get_cv2_api_id(cv2, self.robot_cfg.get("camera_api", "auto"))
+        cv2.setNumThreads(1)
+
+        retries = int(self.robot_cfg.get("camera_open_retries", 5))
+        retry_dt = float(self.robot_cfg.get("camera_open_retry_dt_s", 0.2))
+        last_error = "unknown camera init failure"
+
+        for attempt in range(1, max(retries, 1) + 1):
+            cap = None
+            try:
+                cap, source_desc = _open_camera(
+                    cv2_module=cv2,
+                    camera_api=camera_api,
+                    camera_device_path=camera_device_path,
+                    camera_index=camera_index,
+                )
+                if cap is None:
+                    raise RuntimeError("OpenCV could not open any configured camera source")
+
+                _configure_camera_for_uvc(cap, cv2, self.robot_cfg)
+
+                frame = None
+                for _ in range(10):
+                    frame = _capture_camera_frame(cap, cv2)
+                    if frame is not None:
+                        break
+                    time.sleep(0.02)
+                if frame is None:
+                    raise RuntimeError("Camera opened but failed to return a frame during warmup")
+
+                self._camera = cap
+                self._cv2 = cv2
+                self._camera_source = f"camera:{source_desc}"
+                return
+            except Exception as exc:
+                last_error = str(exc)
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                self._camera = None
+                self._cv2 = None
+                self._camera_source = "placeholder"
+                if attempt < max(retries, 1):
+                    time.sleep(max(retry_dt, 0.0))
+
+        print(f"[WARN] camera initialization failed after {max(retries, 1)} attempts: {last_error}")
+
     def _load_rm_sdk(self) -> None:
         if self._rm_module_loaded:
             return
@@ -415,36 +472,7 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._reference_pos_world = np.array([x, y, z], dtype=np.float64)
         self._reference_rot_world = _euler_xyz_to_matrix(rx, ry, rz)
         self._last_target_pose = np.array([x, y, z, rx, ry, rz], dtype=np.float64)
-
-        camera_device_path = self.robot_cfg.get("camera_device_path")
-        camera_index = self.robot_cfg.get("camera_index")
-        if camera_device_path is not None or camera_index is not None:
-            try:
-                cv2 = importlib.import_module("cv2")
-                camera_api = _get_cv2_api_id(cv2, self.robot_cfg.get("camera_api", "auto"))
-                cv2.setNumThreads(1)
-                cap, source_desc = _open_camera(
-                    cv2_module=cv2,
-                    camera_api=camera_api,
-                    camera_device_path=camera_device_path,
-                    camera_index=camera_index,
-                )
-
-                if cap is None:
-                    self._camera_source = "placeholder"
-                    return
-
-                _configure_camera_for_uvc(cap, cv2, self.robot_cfg)
-
-                if cap.isOpened():
-                    self._camera = cap
-                    self._cv2 = cv2
-                    self._camera_source = f"camera:{source_desc}"
-                else:
-                    cap.release()
-                    self._camera_source = "placeholder"
-            except Exception:
-                self._camera_source = "placeholder"
+        self._connect_camera()
 
     def disconnect(self) -> None:
         if self._camera is not None:
