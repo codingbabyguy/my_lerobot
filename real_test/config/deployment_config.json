@@ -78,7 +78,7 @@
   },
   "robot_adapter": {
     "name": "german_arm",
-    "dry_run": true,
+    "dry_run": false,
     "config": {
       "sdk_src_path": "/home/icrlab/tactile_work_Wy/lerobot/real_test/RM_API2/Demo/RMDemo_Python/RMDemo_SimpleProcess/src",
       "host": "192.168.1.18",
@@ -107,6 +107,8 @@
       "xyz_mean": [-0.02410445963390505, -0.11140210878795122, 0.12321713878896841],
       "xyz_std": [0.013169990073738072, 0.1302399919023768, 0.03226232959912836],
       "workspace_clip_in_adapter": true,
+      "disable_gripper_control": true,
+      "observation_gripper_value": 0.0,
       "camera_api": "auto",
       "camera_device_path": "/dev/v4l/by-id/usb-UGREEN_45647_UGREEN_45647_PRODUCT-video-index0",
       "camera_index": 0,
@@ -123,7 +125,7 @@
       "camera_trim_bottom": 0.0,
       "camera_crop_ratio": 1.0,
       "image_shape": [224, 224, 3],
-      "initial_gripper": 1.0
+      "initial_gripper": 0.0
     }
   }
 }

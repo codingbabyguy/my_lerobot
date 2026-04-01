@@ -258,6 +258,13 @@ def main() -> None:
             raw_action = np.array([raw_action_dict[n] for n in action_names], dtype=np.float64)
             t_inf1 = time.perf_counter()
 
+            if not np.all(np.isfinite(raw_action)):
+                print(f"[ERROR] Non-finite raw_action at step={step}: {raw_action.tolist()}")
+                print(f"[ERROR] observation.state={np.asarray(obs.get('observation.state')).tolist()}")
+                print(f"[ERROR] image_mean={float(np.asarray(obs.get('observation.image')).mean())}")
+                adapter.emergency_stop()
+                break
+
             t_safe0 = time.perf_counter()
             safe_action, flags = safety_filter.apply(raw_action, prev_action, dt_s=target_dt)
             safe_action_dict = {name: float(safe_action[i]) for i, name in enumerate(action_names)}

@@ -346,7 +346,14 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._trajectory_enum: Any = None
         self._rm_module_loaded = False
         self._image_shape = tuple(robot_cfg.get("image_shape", [224, 224, 3]))
-        self._last_gripper = float(robot_cfg.get("initial_gripper", 1.0))
+        self._disable_gripper_control = bool(robot_cfg.get("disable_gripper_control", True))
+        self._observation_gripper_value = float(
+            robot_cfg.get(
+                "observation_gripper_value",
+                0.0 if self._disable_gripper_control else robot_cfg.get("initial_gripper", 0.0),
+            )
+        )
+        self._last_gripper = float(robot_cfg.get("initial_gripper", self._observation_gripper_value))
         self._last_target_pose: np.ndarray | None = None
         self._camera = None
         self._camera_source = "placeholder"
@@ -561,7 +568,7 @@ class GermanArmAdapter(BaseRobotAdapter):
         obs_state = np.zeros(10, dtype=np.float32)
         obs_state[0:3] = pos_policy.astype(np.float32)
         obs_state[3:9] = rot6d.astype(np.float32)
-        obs_state[9] = np.float32(self._last_gripper)
+        obs_state[9] = np.float32(self._observation_gripper_value if self._disable_gripper_control else self._last_gripper)
 
         image = self._capture_image()
         return {
@@ -604,10 +611,10 @@ class GermanArmAdapter(BaseRobotAdapter):
             if ret != 0:
                 raise RuntimeError(f"send_action failed: rm_movep_canfd={ret}")
 
-        # First-stage real robot validation keeps gripper control disabled.
-        # We still track a stable normalized value for observation.state.
         gripper = float(action.get("gripper", self._last_gripper))
-        if np.isfinite(gripper):
+        if self._disable_gripper_control:
+            self._last_gripper = self._observation_gripper_value
+        elif np.isfinite(gripper):
             self._last_gripper = float(np.clip(gripper, 0.0, 1.0))
 
     def wait_until_action_complete(self, timeout_s: float) -> bool:
