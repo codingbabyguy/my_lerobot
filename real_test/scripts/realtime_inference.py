@@ -137,6 +137,9 @@ def main() -> None:
         max_xyz_speed_mps=float(cfg["safety"]["max_xyz_speed_mps"]),
         max_rot_delta_rad=float(cfg["safety"]["max_rot_delta_rad"]),
         max_gripper_delta_per_step=float(cfg["safety"]["max_gripper_delta_per_step"]),
+        clip_workspace_in_action_space=not bool(
+            cfg["robot_adapter"]["config"].get("workspace_clip_in_adapter", False)
+        ),
     )
     safety_filter = ActionSafetyFilter(safety_cfg, action_names)
     estop = EStop(cfg["estop"]["enabled"], cfg["estop"]["trigger_file"])
@@ -172,9 +175,12 @@ def main() -> None:
     preprocessor.reset()
     postprocessor.reset()
 
+    robot_adapter_cfg = dict(cfg["robot_adapter"]["config"])
+    robot_adapter_cfg.setdefault("workspace_bounds_world", cfg["safety"]["workspace_bounds"])
+
     adapter = make_robot_adapter(
         cfg["robot_adapter"]["name"],
-        cfg["robot_adapter"]["config"],
+        robot_adapter_cfg,
         dry_run=(args.dry_run or bool(cfg["robot_adapter"].get("dry_run", False))),
     )
 

@@ -356,6 +356,7 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._xyz_std = np.maximum(self._xyz_std, 1e-6)
         self._reference_pos_world: np.ndarray | None = None
         self._reference_rot_world: np.ndarray | None = None
+        self._workspace_bounds_world = robot_cfg.get("workspace_bounds_world", {})
 
     def _load_rm_sdk(self) -> None:
         if self._rm_module_loaded:
@@ -503,6 +504,18 @@ class GermanArmAdapter(BaseRobotAdapter):
         rot_world = self._reference_rot_world @ rot_policy
         return pos_world, rot_world
 
+    def _clip_world_position(self, pos_world: np.ndarray) -> np.ndarray:
+        pos = np.asarray(pos_world, dtype=np.float64).copy()
+        bounds = self._workspace_bounds_world
+        if not isinstance(bounds, dict):
+            return pos
+        for idx, axis in enumerate(("x", "y", "z")):
+            axis_bounds = bounds.get(axis)
+            if not isinstance(axis_bounds, (list, tuple)) or len(axis_bounds) != 2:
+                continue
+            pos[idx] = float(np.clip(pos[idx], float(axis_bounds[0]), float(axis_bounds[1])))
+        return pos
+
     def get_observation(self) -> dict[str, np.ndarray]:
         if not self.connected or self._robot is None:
             raise RuntimeError("GermanArmAdapter is not connected")
@@ -536,6 +549,7 @@ class GermanArmAdapter(BaseRobotAdapter):
         rot_policy = rot6d_to_matrix(rot6d)
         pos_policy = np.array([action["x"], action["y"], action["z"]], dtype=np.float64)
         pos_world, rot_world = self._policy_to_world_pose(pos_policy, rot_policy)
+        pos_world = self._clip_world_position(pos_world)
         euler = _matrix_to_euler_xyz(rot_world)
 
         pose = [

@@ -106,6 +106,7 @@
       ],
       "xyz_mean": [-0.02410445963390505, -0.11140210878795122, 0.12321713878896841],
       "xyz_std": [0.013169990073738072, 0.1302399919023768, 0.03226232959912836],
+      "workspace_clip_in_adapter": true,
       "camera_api": "auto",
       "camera_device_path": "/dev/v4l/by-id/usb-UGREEN_45647_UGREEN_45647_PRODUCT-video-index0",
       "camera_index": 0,

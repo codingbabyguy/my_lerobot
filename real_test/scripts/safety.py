@@ -16,6 +16,7 @@ class SafetyConfig:
     max_xyz_speed_mps: float
     max_rot_delta_rad: float
     max_gripper_delta_per_step: float
+    clip_workspace_in_action_space: bool = True
 
 
 class EStop:
@@ -119,13 +120,14 @@ class ActionSafetyFilter:
                 flags.append(f"clip:{name}")
             out[idx] = clipped
 
-        for axis in ("x", "y", "z"):
-            idx = self.name_to_idx[axis]
-            low, high = self.cfg.workspace_bounds[axis]
-            clipped = _clip(out[idx], low, high)
-            if clipped != out[idx]:
-                flags.append(f"workspace:{axis}")
-            out[idx] = clipped
+        if self.cfg.clip_workspace_in_action_space:
+            for axis in ("x", "y", "z"):
+                idx = self.name_to_idx[axis]
+                low, high = self.cfg.workspace_bounds[axis]
+                clipped = _clip(out[idx], low, high)
+                if clipped != out[idx]:
+                    flags.append(f"workspace:{axis}")
+                out[idx] = clipped
 
         rot_idx = [self.name_to_idx[f"rot6d_{i}"] for i in range(6)]
         r_curr = rot6d_to_matrix(out[rot_idx])
