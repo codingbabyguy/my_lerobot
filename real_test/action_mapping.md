@@ -12,16 +12,20 @@ This document freezes the action contract between policy output and the real rob
 
 | Index | Name     | Meaning                                | Unit      | Frame      |
 |------:|----------|----------------------------------------|-----------|------------|
-| 0     | x        | End-effector position X                 | meter     | robot_base |
-| 1     | y        | End-effector position Y                 | meter     | robot_base |
-| 2     | z        | End-effector position Z                 | meter     | robot_base |
-| 3     | rot6d_0  | Rotation 6D first column, element 0     | unitless  | robot_base |
-| 4     | rot6d_1  | Rotation 6D first column, element 1     | unitless  | robot_base |
-| 5     | rot6d_2  | Rotation 6D first column, element 2     | unitless  | robot_base |
-| 6     | rot6d_3  | Rotation 6D second column, element 0    | unitless  | robot_base |
-| 7     | rot6d_4  | Rotation 6D second column, element 1    | unitless  | robot_base |
-| 8     | rot6d_5  | Rotation 6D second column, element 2    | unitless  | robot_base |
+| 0     | x        | End-effector position X                 | meter     | manual_relative_frame |
+| 1     | y        | End-effector position Y                 | meter     | manual_relative_frame |
+| 2     | z        | End-effector position Z                 | meter     | manual_relative_frame |
+| 3     | rot6d_0  | Rotation 6D first column, element 0     | unitless  | manual_relative_frame |
+| 4     | rot6d_1  | Rotation 6D first column, element 1     | unitless  | manual_relative_frame |
+| 5     | rot6d_2  | Rotation 6D first column, element 2     | unitless  | manual_relative_frame |
+| 6     | rot6d_3  | Rotation 6D second column, element 0    | unitless  | manual_relative_frame |
+| 7     | rot6d_4  | Rotation 6D second column, element 1    | unitless  | manual_relative_frame |
+| 8     | rot6d_5  | Rotation 6D second column, element 2    | unitless  | manual_relative_frame |
 | 9     | gripper  | Gripper open ratio (0 close, 1 open)    | normalized| gripper    |
+
+At runtime, adapter maps this manual frame action into RM base frame pose by:
+- `p_base = manual_origin + manual_rotation @ p_manual`
+- `R_base = manual_rotation @ R_manual`
 
 ## Rotation Convention
 
@@ -69,7 +73,8 @@ Robot adapter must consume the same keys and must not reorder dimensions.
 
 ## Deployment Checklist
 
-- Verify robot base frame direction (+X/+Y/+Z) matches training frame.
+- Verify `manual_origin/manual_rotation` comes from the same collection calibration.
+- Verify RM current work/tool frame matches expected frame names before inference.
 - Verify gripper polarity (0 close, 1 open).
 - Verify action keys and order unchanged.
 - Verify preprocessor/postprocessor files are loaded from the same checkpoint folder.

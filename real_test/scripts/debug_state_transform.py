@@ -17,7 +17,7 @@ if str(SRC_DIR) not in sys.path:
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from adapters import _euler_xyz_to_matrix, make_robot_adapter
+from adapters import make_robot_adapter
 from safety import matrix_to_rot6d
 
 
@@ -33,6 +33,12 @@ def main() -> None:
         type=str,
         default="/home/icrlab/tactile_work_Wy/lerobot/real_test/config/deployment_config.json",
     )
+    parser.add_argument(
+        "--output-json",
+        type=str,
+        default="",
+        help="Optional path to dump debug information as json",
+    )
     args = parser.parse_args()
 
     cfg = _load_json(args.config)
@@ -47,39 +53,48 @@ def main() -> None:
         if not hasattr(adapter, "_robot") or adapter._robot is None:
             raise RuntimeError("Robot adapter did not create a real robot handle.")
 
-        ret, state = adapter._robot.rm_get_current_arm_state()
-        if ret != 0:
-            raise RuntimeError(f"rm_get_current_arm_state failed with code {ret}")
-
-        pose = np.asarray(state.get("pose", [0.0, 0.0, 0.2, 0.0, 0.0, 0.0]), dtype=np.float64)
-        pos_world = pose[:3]
-        euler_world = pose[3:]
-        rot_world = _euler_xyz_to_matrix(*euler_world.tolist())
-
-        ref_pos = adapter._reference_pos_world
-        ref_rot = adapter._reference_rot_world
-        if ref_pos is None or ref_rot is None:
-            raise RuntimeError("Reference pose is not initialized")
-        rel_pos = ref_rot.T @ (pos_world - ref_pos)
-        rel_rot = ref_rot.T @ rot_world
-        pos_norm = (rel_pos - adapter._xyz_mean) / adapter._xyz_std
-        rot6d = matrix_to_rot6d(rel_rot)
+        pos_base, rot_base, pose_base = adapter._read_current_pose_base()
+        pos_manual, rot_manual = adapter._base_to_manual_pose(pos_base, rot_base)
+        rot6d = matrix_to_rot6d(rot_manual)
 
         obs = adapter.get_observation()
+        obs_state = np.asarray(obs["observation.state"], dtype=np.float64).reshape(-1)
+
+        debug_info = {
+            "camera_source": adapter.camera_source(),
+            "frame_lock": {
+                "work": getattr(adapter, "_connected_work_frame_name", None),
+                "tool": getattr(adapter, "_connected_tool_frame_name", None),
+            },
+            "manual_origin_base": adapter._manual_origin_base.tolist(),
+            "manual_rotation_base": adapter._manual_rotation_base.tolist(),
+            "pose_base_euler": pose_base.tolist(),
+            "manual_position_from_pose": pos_manual.tolist(),
+            "manual_rot6d_from_pose": rot6d.tolist(),
+            "observation_state": obs_state.tolist(),
+            "state_minus_manual_pose": (obs_state[:9] - np.concatenate([pos_manual, rot6d], axis=0)).tolist(),
+            "image_mean": float(obs["observation.image"].mean()),
+        }
 
         np.set_printoptions(precision=6, suppress=True)
-        print("camera_source =", adapter.camera_source())
-        print("raw_pose_world =", pose.tolist())
-        print("reference_pos_world =", ref_pos.tolist())
-        print("reference_rot_world =")
-        print(ref_rot)
-        print("xyz_mean =", adapter._xyz_mean.tolist())
-        print("xyz_std =", adapter._xyz_std.tolist())
-        print("rel_pos_reference =", rel_pos.tolist())
-        print("pos_norm =", pos_norm.tolist())
-        print("rot6d_reference =", rot6d.tolist())
-        print("observation.state =", obs["observation.state"].tolist())
-        print("image_mean =", float(obs["observation.image"].mean()))
+        print("camera_source =", debug_info["camera_source"])
+        print("frame_lock =", debug_info["frame_lock"])
+        print("pose_base_euler =", debug_info["pose_base_euler"])
+        print("manual_origin_base =", debug_info["manual_origin_base"])
+        print("manual_rotation_base =")
+        print(np.asarray(debug_info["manual_rotation_base"]))
+        print("manual_position_from_pose =", debug_info["manual_position_from_pose"])
+        print("manual_rot6d_from_pose =", debug_info["manual_rot6d_from_pose"])
+        print("observation.state =", debug_info["observation_state"])
+        print("state_minus_manual_pose =", debug_info["state_minus_manual_pose"])
+        print("image_mean =", debug_info["image_mean"])
+
+        if args.output_json:
+            out_path = Path(args.output_json).expanduser().resolve()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with out_path.open("w", encoding="utf-8") as f:
+                json.dump(debug_info, f, indent=2)
+            print(f"[OK] wrote debug json: {out_path}")
     finally:
         adapter.disconnect()
 

@@ -10,7 +10,7 @@ dataset.meta_info_path	数据集 info.json 路径	建议与 root 对齐
 dataset.meta_stats_path	数据集 stats.json 路径	建议与 root 对齐
 checkpoint.pretrained_model_path	推理模型路径	必须是可用 checkpoint 的 pretrained_model 目录
 control（控制主循环）
-配置项	含义	建议rm -rf my_lerobot/.git
+配置项	含义	建议
 control.target_hz	目标循环频率	先 10Hz
 control.execution_mode	执行模式（serial 串行）	保持 serial
 control.action_wait_timeout_s	单步动作完成等待超时	2~5 秒按实机调
@@ -25,7 +25,7 @@ estop.trigger_file	急停触发文件	保持 /tmp/lerobot_estop
 action_schema（动作语义）
 配置项	含义	建议
 action_schema.names	动作维度顺序	必须与训练数据一致，勿改顺序
-action_schema.coordinate_frame	坐标系	robot_base
+action_schema.coordinate_frame	坐标系	manual_relative_frame
 action_schema.position_unit	位置单位	meter
 action_schema.rotation_representation	旋转表示	rot6d
 action_schema.gripper_unit	夹爪单位	normalized
@@ -57,8 +57,10 @@ config.completion_pose_tol_m	到位位置容差	实机可适当放宽
 config.completion_rot_tol_rad	到位姿态容差	实机可适当放宽
 config.manual_origin	采集标定参考系原点	来自 calibration_params.npz
 config.manual_rotation	采集标定参考系旋转矩阵	来自 calibration_params.npz
-config.xyz_mean	训练时相对位置 Z-score 均值	来自 convert_session_to_lerobot_dp.py 输出
-config.xyz_std	训练时相对位置 Z-score 标准差	来自 convert_session_to_lerobot_dp.py 输出
+config.lock_work_tool_frame	连接时检查 RM work/tool frame	true
+config.expected_work_frame_names	允许的 work frame 名称列表	先用 check_rm_frames.py 实测后填写
+config.expected_tool_frame_names	允许的 tool frame 名称列表	先用 check_rm_frames.py 实测后填写
+config.workspace_clip_in_adapter	是否在适配器做 base-frame workspace 裁剪	建议 false（由 safety 在策略坐标系裁剪）
 config.camera_api	相机接口后端	按当前 OpenCV 构建选择；你这台机器更建议 auto
 config.camera_device_path	稳定视频设备路径	优先用 /dev/v4l/by-id/...video-index0
 config.camera_index	本机相机索引	普通 USB 摄像头可用；有 device_path 时可忽略

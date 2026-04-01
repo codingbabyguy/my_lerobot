@@ -128,6 +128,13 @@ def _euler_xyz_to_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
     return rz_m @ ry_m @ rx_m
 
 
+def _rotation_geodesic_distance(r_a: np.ndarray, r_b: np.ndarray) -> float:
+    """Smallest angle (rad) between two rotation matrices."""
+    rel = r_a.T @ r_b
+    cos_theta = float(np.clip((np.trace(rel) - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.arccos(cos_theta))
+
+
 def _as_float_vector(value: Any, length: int, default: list[float] | None = None) -> np.ndarray:
     if value is None:
         if default is None:
@@ -358,12 +365,43 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._camera = None
         self._camera_source = "placeholder"
         self._cv2 = None
-        self._xyz_mean = _as_float_vector(robot_cfg.get("xyz_mean"), 3, default=[0.0, 0.0, 0.0])
-        self._xyz_std = _as_float_vector(robot_cfg.get("xyz_std"), 3, default=[1.0, 1.0, 1.0])
-        self._xyz_std = np.maximum(self._xyz_std, 1e-6)
-        self._reference_pos_world: np.ndarray | None = None
-        self._reference_rot_world: np.ndarray | None = None
-        self._workspace_bounds_world = robot_cfg.get("workspace_bounds_world", {})
+        manual_origin = robot_cfg.get("manual_origin")
+        manual_rotation = robot_cfg.get("manual_rotation")
+        if manual_origin is None or manual_rotation is None:
+            raise ValueError(
+                "manual_origin and manual_rotation are required. "
+                "Use calibration_params.npz values from data collection."
+            )
+        self._manual_origin_base = _as_float_vector(manual_origin, 3)
+        self._manual_rotation_base = _as_float_matrix(manual_rotation, (3, 3))
+        self._workspace_clip_in_adapter = bool(robot_cfg.get("workspace_clip_in_adapter", False))
+        self._workspace_bounds_base = robot_cfg.get(
+            "workspace_bounds_base",
+            robot_cfg.get("workspace_bounds_world", {}),
+        )
+        self._use_sdk_pose_transform = bool(robot_cfg.get("use_sdk_pose_transform", True))
+        self._lock_work_tool_frame = bool(robot_cfg.get("lock_work_tool_frame", True))
+        self._expected_work_frame_names = [
+            self._normalize_frame_name(x)
+            for x in robot_cfg.get("expected_work_frame_names", [])
+            if str(x).strip()
+        ]
+        self._expected_tool_frame_names = [
+            self._normalize_frame_name(x)
+            for x in robot_cfg.get("expected_tool_frame_names", [])
+            if str(x).strip()
+        ]
+        self._connected_work_frame_name: str | None = None
+        self._connected_tool_frame_name: str | None = None
+        self._last_target_pose_base: np.ndarray | None = None
+
+        ortho_check = self._manual_rotation_base.T @ self._manual_rotation_base
+        if not np.allclose(ortho_check, np.eye(3), atol=1e-5):
+            raise ValueError("manual_rotation must be orthonormal")
+        if float(np.linalg.det(self._manual_rotation_base)) <= 0.0:
+            raise ValueError("manual_rotation must be a right-handed rotation matrix")
+        if self._workspace_clip_in_adapter and not isinstance(self._workspace_bounds_base, dict):
+            raise ValueError("workspace_bounds_base must be a dict when workspace_clip_in_adapter=true")
 
     def _connect_camera(self) -> None:
         camera_device_path = self.robot_cfg.get("camera_device_path")
@@ -445,6 +483,109 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._trajectory_enum = rm_module.rm_trajectory_connect_config_e
         self._rm_module_loaded = True
 
+    @staticmethod
+    def _normalize_frame_name(name: Any) -> str:
+        if name is None:
+            return ""
+        return str(name).replace("\x00", "").strip().lower()
+
+    @staticmethod
+    def _extract_frame_name(frame_obj: Any) -> str:
+        if not isinstance(frame_obj, dict):
+            return ""
+        for key in ("name", "frame_name", "frame"):
+            if key in frame_obj and frame_obj[key] is not None:
+                return GermanArmAdapter._normalize_frame_name(frame_obj[key])
+        return ""
+
+    def _refresh_connected_frames(self) -> None:
+        if self._robot is None:
+            return
+
+        work_name = ""
+        tool_name = ""
+
+        if hasattr(self._robot, "rm_get_current_work_frame"):
+            try:
+                ret_work, work = self._robot.rm_get_current_work_frame()
+                if ret_work == 0:
+                    work_name = self._extract_frame_name(work)
+                else:
+                    print(f"[WARN] rm_get_current_work_frame failed with code {ret_work}")
+            except Exception as exc:
+                print(f"[WARN] rm_get_current_work_frame error: {exc}")
+
+        if hasattr(self._robot, "rm_get_current_tool_frame"):
+            try:
+                ret_tool, tool = self._robot.rm_get_current_tool_frame()
+                if ret_tool == 0:
+                    tool_name = self._extract_frame_name(tool)
+                else:
+                    print(f"[WARN] rm_get_current_tool_frame failed with code {ret_tool}")
+            except Exception as exc:
+                print(f"[WARN] rm_get_current_tool_frame error: {exc}")
+
+        self._connected_work_frame_name = work_name or None
+        self._connected_tool_frame_name = tool_name or None
+
+    def _validate_frame_lock(self) -> None:
+        if not self._lock_work_tool_frame:
+            return
+
+        if self._expected_work_frame_names and self._connected_work_frame_name is not None:
+            if self._connected_work_frame_name not in self._expected_work_frame_names:
+                raise RuntimeError(
+                    "Current RM work frame does not match expected list: "
+                    f"current={self._connected_work_frame_name}, expected={self._expected_work_frame_names}"
+                )
+        if self._expected_tool_frame_names and self._connected_tool_frame_name is not None:
+            if self._connected_tool_frame_name not in self._expected_tool_frame_names:
+                raise RuntimeError(
+                    "Current RM tool frame does not match expected list: "
+                    f"current={self._connected_tool_frame_name}, expected={self._expected_tool_frame_names}"
+                )
+
+    def _read_current_pose_base(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self._robot is None:
+            raise RuntimeError("Robot handle is not initialized")
+        ret, state = self._robot.rm_get_current_arm_state()
+        if ret != 0:
+            raise RuntimeError(f"rm_get_current_arm_state failed with code {ret}")
+        pose = np.asarray(state.get("pose", [0.0, 0.0, 0.2, 0.0, 0.0, 0.0]), dtype=np.float64).reshape(-1)
+        if pose.shape[0] < 6:
+            raise RuntimeError(f"Invalid RM pose shape: {pose.shape}")
+        pos_base = pose[:3]
+        rot_base = _euler_xyz_to_matrix(float(pose[3]), float(pose[4]), float(pose[5]))
+        pose6 = np.array(
+            [float(pos_base[0]), float(pos_base[1]), float(pos_base[2]), float(pose[3]), float(pose[4]), float(pose[5])],
+            dtype=np.float64,
+        )
+        return pos_base, rot_base, pose6
+
+    def _base_to_manual_pose(self, pos_base: np.ndarray, rot_base: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        pos_manual = self._manual_rotation_base.T @ (pos_base - self._manual_origin_base)
+        rot_manual = self._manual_rotation_base.T @ rot_base
+        return pos_manual, rot_manual
+
+    def _manual_to_base_pose(self, pos_manual: np.ndarray, rot_manual: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        pos_base = self._manual_origin_base + self._manual_rotation_base @ pos_manual
+        rot_base = self._manual_rotation_base @ rot_manual
+        return pos_base, rot_base
+
+    def _clip_base_position(self, pos_base: np.ndarray) -> np.ndarray:
+        pos = np.asarray(pos_base, dtype=np.float64).copy()
+        if not self._workspace_clip_in_adapter:
+            return pos
+        bounds = self._workspace_bounds_base
+        if not isinstance(bounds, dict):
+            return pos
+        for idx, axis in enumerate(("x", "y", "z")):
+            axis_bounds = bounds.get(axis)
+            if not isinstance(axis_bounds, (list, tuple)) or len(axis_bounds) != 2:
+                continue
+            pos[idx] = float(np.clip(pos[idx], float(axis_bounds[0]), float(axis_bounds[1])))
+        return pos
+
     def connect(self) -> None:
         self._load_rm_sdk()
 
@@ -470,26 +611,45 @@ class GermanArmAdapter(BaseRobotAdapter):
 
         self._robot = robot
         self.connected = True
-
-        ret, state = self._robot.rm_get_current_arm_state()
-        if ret != 0:
-            raise RuntimeError(f"rm_get_current_arm_state failed during reference capture: code {ret}")
-        pose = state.get("pose", [0.0, 0.0, 0.2, 0.0, 0.0, 0.0])
-        x, y, z, rx, ry, rz = [float(v) for v in pose]
-        self._reference_pos_world = np.array([x, y, z], dtype=np.float64)
-        self._reference_rot_world = _euler_xyz_to_matrix(rx, ry, rz)
-        self._last_target_pose = np.array([x, y, z, rx, ry, rz], dtype=np.float64)
-        self._connect_camera()
+        try:
+            self._refresh_connected_frames()
+            self._validate_frame_lock()
+            _, _, pose6 = self._read_current_pose_base()
+            self._last_target_pose = pose6.copy()
+            self._last_target_pose_base = pose6.copy()
+            if self._connected_work_frame_name is not None or self._connected_tool_frame_name is not None:
+                print(
+                    "[INFO] RM frame lock: "
+                    f"work={self._connected_work_frame_name or 'unknown'}, "
+                    f"tool={self._connected_tool_frame_name or 'unknown'}"
+                )
+            if self._use_sdk_pose_transform and not self._lock_work_tool_frame:
+                print(
+                    "[WARN] use_sdk_pose_transform=true but frame lock is disabled; "
+                    "ensure rm_get_current_arm_state pose semantics match training frame."
+                )
+            self._connect_camera()
+        except Exception:
+            try:
+                self._robot.rm_delete_robot_arm()
+            except Exception:
+                pass
+            self._robot = None
+            self.connected = False
+            raise
 
     def disconnect(self) -> None:
         if self._camera is not None:
             self._camera.release()
             self._camera = None
-        self._reference_pos_world = None
-        self._reference_rot_world = None
+        self._connected_work_frame_name = None
+        self._connected_tool_frame_name = None
+        self._last_target_pose = None
+        self._last_target_pose_base = None
         if not self.connected or self._robot is None:
             return
         self._robot.rm_delete_robot_arm()
+        self._robot = None
         self.connected = False
 
     def _capture_image(self) -> np.ndarray:
@@ -523,50 +683,16 @@ class GermanArmAdapter(BaseRobotAdapter):
             crop_ratio=crop_ratio,
         )
 
-    def _world_to_policy_pose(self, pos_world: np.ndarray, rot_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        if self._reference_pos_world is None or self._reference_rot_world is None:
-            raise RuntimeError("Reference pose is not initialized")
-        pos_rel = self._reference_rot_world.T @ (pos_world - self._reference_pos_world)
-        rot_rel = self._reference_rot_world.T @ rot_world
-        pos_norm = (pos_rel - self._xyz_mean) / self._xyz_std
-        return pos_norm, rot_rel
-
-    def _policy_to_world_pose(self, pos_policy: np.ndarray, rot_policy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        if self._reference_pos_world is None or self._reference_rot_world is None:
-            raise RuntimeError("Reference pose is not initialized")
-        pos_rel = pos_policy * self._xyz_std + self._xyz_mean
-        pos_world = self._reference_pos_world + self._reference_rot_world @ pos_rel
-        rot_world = self._reference_rot_world @ rot_policy
-        return pos_world, rot_world
-
-    def _clip_world_position(self, pos_world: np.ndarray) -> np.ndarray:
-        pos = np.asarray(pos_world, dtype=np.float64).copy()
-        bounds = self._workspace_bounds_world
-        if not isinstance(bounds, dict):
-            return pos
-        for idx, axis in enumerate(("x", "y", "z")):
-            axis_bounds = bounds.get(axis)
-            if not isinstance(axis_bounds, (list, tuple)) or len(axis_bounds) != 2:
-                continue
-            pos[idx] = float(np.clip(pos[idx], float(axis_bounds[0]), float(axis_bounds[1])))
-        return pos
-
     def get_observation(self) -> dict[str, np.ndarray]:
         if not self.connected or self._robot is None:
             raise RuntimeError("GermanArmAdapter is not connected")
 
-        ret, state = self._robot.rm_get_current_arm_state()
-        if ret != 0:
-            raise RuntimeError(f"rm_get_current_arm_state failed with code {ret}")
-
-        pose = state.get("pose", [0.0, 0.0, 0.2, 0.0, 0.0, 0.0])
-        x, y, z, rx, ry, rz = [float(v) for v in pose]
-        rot_m = _euler_xyz_to_matrix(rx, ry, rz)
-        pos_policy, rot_policy = self._world_to_policy_pose(np.array([x, y, z], dtype=np.float64), rot_m)
-        rot6d = matrix_to_rot6d(rot_policy)
+        pos_base, rot_base, _ = self._read_current_pose_base()
+        pos_manual, rot_manual = self._base_to_manual_pose(pos_base, rot_base)
+        rot6d = matrix_to_rot6d(rot_manual)
 
         obs_state = np.zeros(10, dtype=np.float32)
-        obs_state[0:3] = pos_policy.astype(np.float32)
+        obs_state[0:3] = pos_manual.astype(np.float32)
         obs_state[3:9] = rot6d.astype(np.float32)
         obs_state[9] = np.float32(self._observation_gripper_value if self._disable_gripper_control else self._last_gripper)
 
@@ -580,22 +706,27 @@ class GermanArmAdapter(BaseRobotAdapter):
         if not self.connected or self._robot is None:
             raise RuntimeError("GermanArmAdapter is not connected")
 
-        rot6d = np.array([action[f"rot6d_{i}"] for i in range(6)], dtype=np.float64)
-        rot_policy = rot6d_to_matrix(rot6d)
-        pos_policy = np.array([action["x"], action["y"], action["z"]], dtype=np.float64)
-        pos_world, rot_world = self._policy_to_world_pose(pos_policy, rot_policy)
-        pos_world = self._clip_world_position(pos_world)
-        euler = _matrix_to_euler_xyz(rot_world)
+        try:
+            rot6d = np.array([float(action[f"rot6d_{i}"]) for i in range(6)], dtype=np.float64)
+            pos_manual = np.array([float(action["x"]), float(action["y"]), float(action["z"])], dtype=np.float64)
+        except KeyError as exc:
+            raise KeyError(f"Missing action key: {exc}") from exc
+
+        rot_manual = rot6d_to_matrix(rot6d)
+        pos_base, rot_base = self._manual_to_base_pose(pos_manual, rot_manual)
+        pos_base = self._clip_base_position(pos_base)
+        euler = _matrix_to_euler_xyz(rot_base)
 
         pose = [
-            float(pos_world[0]),
-            float(pos_world[1]),
-            float(pos_world[2]),
+            float(pos_base[0]),
+            float(pos_base[1]),
+            float(pos_base[2]),
             float(euler[0]),
             float(euler[1]),
             float(euler[2]),
         ]
         self._last_target_pose = np.array(pose, dtype=np.float64)
+        self._last_target_pose_base = self._last_target_pose.copy()
 
         speed = int(self.robot_cfg.get("movep_canfd_speed", 50))
         follow = bool(self.robot_cfg.get("movep_canfd_follow", False))
@@ -626,17 +757,25 @@ class GermanArmAdapter(BaseRobotAdapter):
         pose_tol = float(self.robot_cfg.get("completion_pose_tol_m", 0.005))
         rot_tol = float(self.robot_cfg.get("completion_rot_tol_rad", 0.08))
         t_end = time.perf_counter() + timeout_s
+        target_pose = self._last_target_pose_base
 
         while time.perf_counter() < t_end:
             traj = self._robot.rm_get_arm_current_trajectory()
             traj_type = int(traj.get("trajectory_type", 1))
 
-            ret, state = self._robot.rm_get_current_arm_state()
-            if ret == 0 and self._last_target_pose is not None:
-                pose = state.get("pose", [0.0, 0.0, 0.2, 0.0, 0.0, 0.0])
-                cur = np.array([float(v) for v in pose], dtype=np.float64)
-                pos_err = float(np.linalg.norm(cur[:3] - self._last_target_pose[:3]))
-                rot_err = float(np.linalg.norm(cur[3:] - self._last_target_pose[3:]))
+            if target_pose is not None:
+                try:
+                    _, _, cur = self._read_current_pose_base()
+                except Exception:
+                    cur = None
+                if cur is not None:
+                    pos_err = float(np.linalg.norm(cur[:3] - target_pose[:3]))
+                    cur_rot = _euler_xyz_to_matrix(float(cur[3]), float(cur[4]), float(cur[5]))
+                    tar_rot = _euler_xyz_to_matrix(float(target_pose[3]), float(target_pose[4]), float(target_pose[5]))
+                    rot_err = _rotation_geodesic_distance(tar_rot, cur_rot)
+                else:
+                    pos_err = float("inf")
+                    rot_err = float("inf")
                 if traj_type == 0 and pos_err <= pose_tol and rot_err <= rot_tol:
                     return True
             elif traj_type == 0:

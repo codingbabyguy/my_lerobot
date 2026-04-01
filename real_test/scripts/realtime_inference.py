@@ -109,6 +109,7 @@ def main() -> None:
 
     latency_csv = cfg["control"]["latency_log_csv"]
     action_csv = cfg["control"]["action_log_csv"]
+    observation_csv = cfg["control"].get("observation_log_csv")
     _write_csv_header(
         latency_csv,
         [
@@ -131,6 +132,8 @@ def main() -> None:
         ],
     )
     _write_csv_header(action_csv, ["step", *action_names])
+    if observation_csv:
+        _write_csv_header(observation_csv, ["step", *action_names])
 
     safety_cfg = SafetyConfig(
         action_bounds=cfg["safety"]["action_bounds"],
@@ -177,7 +180,14 @@ def main() -> None:
     postprocessor.reset()
 
     robot_adapter_cfg = dict(cfg["robot_adapter"]["config"])
-    robot_adapter_cfg.setdefault("workspace_bounds_world", cfg["safety"]["workspace_bounds"])
+    if robot_adapter_cfg.get("workspace_clip_in_adapter", False):
+        has_base_bounds = "workspace_bounds_base" in robot_adapter_cfg or "workspace_bounds_world" in robot_adapter_cfg
+        if not has_base_bounds:
+            print(
+                "[WARN] workspace_clip_in_adapter=true but workspace_bounds_base/workspace_bounds_world is missing. "
+                "Disable adapter-side clip and keep safety clip in policy frame."
+            )
+            robot_adapter_cfg["workspace_clip_in_adapter"] = False
 
     adapter = make_robot_adapter(
         cfg["robot_adapter"]["name"],
@@ -242,6 +252,12 @@ def main() -> None:
             t_obs0 = time.perf_counter()
             obs = adapter.get_observation()
             t_obs1 = time.perf_counter()
+            obs_state = np.asarray(obs.get("observation.state"), dtype=np.float64).reshape(-1)
+            if obs_state.shape[0] != len(action_names):
+                raise RuntimeError(
+                    "Invalid observation.state shape from adapter: "
+                    f"expected {len(action_names)}, got {obs_state.shape[0]}"
+                )
 
             t_inf0 = time.perf_counter()
             action_tensor = predict_action(
@@ -325,6 +341,8 @@ def main() -> None:
                 ],
             )
             _append_csv(action_csv, [step, *[f"{x:.8f}" for x in safe_action.tolist()]])
+            if observation_csv:
+                _append_csv(observation_csv, [step, *[f"{x:.8f}" for x in obs_state.tolist()]])
             keyboard.clear_last_key()
 
             if step < debug_print_steps:

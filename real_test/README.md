@@ -10,6 +10,12 @@
 
 同时包含安全约束、急停、键盘控制、日志和可视化。
 
+坐标系约定（关键）：
+
+1. 训练与策略输入输出都使用 `manual_relative_frame`。
+2. 机器人适配器在运行时做双向变换：`manual_relative_frame <-> RM base frame`。
+3. `manual_origin/manual_rotation` 必须来自同一次数据采集标定。
+
 ## 1. 目录与脚本作用
 
 - `action_mapping.md`：10维动作定义（x,y,z,rot6d_0~5,gripper）与坐标/单位约定。
@@ -47,6 +53,9 @@
 - `robot_adapter.config.sdk_src_path`: RM Python SDK 路径
 - `robot_adapter.config.host`: 机械臂控制器IP
 - `robot_adapter.config.port`: 控制器端口（通常 `8080`）
+- `robot_adapter.config.manual_origin` / `manual_rotation`: 来自采集标定参数
+- `robot_adapter.config.lock_work_tool_frame`: 建议 `true`
+- `robot_adapter.config.expected_work_frame_names` / `expected_tool_frame_names`: 先用 `check_rm_frames.py` 实测后填写
 
 ### 2.4 动作完成判定参数（串行闭环关键）
 
@@ -132,6 +141,21 @@ cd /home/icrlab/tactile_work_Wy/lerobot
 - `real_test/results/camera_check/dataset_reference.png`
 - `real_test/results/camera_check/compare_side_by_side.png`
 
+## 3.1 从转换模板生成部署配置（推荐）
+
+`convert_session_to_lerobot_dp.py` 会输出 `reports/deployment_manual_frame_template.json`。  
+建议用下面脚本把模板合并进实时配置，避免手工抄错 action_bounds / 标定参数：
+
+```bash
+cd /home/icrlab/tactile_work_Wy/lerobot
+/home/icrlab/miniforge3/envs/lerobot/bin/python real_test/scripts/build_deployment_config.py \
+  --template /path/to/lerobot_v3/reports/deployment_manual_frame_template.json \
+  --base-config real_test/config/deployment_config.json \
+  --output real_test/config/deployment_config.generated.json
+```
+
+然后把后续命令中的 `--config` 指向 `deployment_config.generated.json`。
+
 ## 4. 推荐运行顺序（从稳到真机）
 
 ## 4.1 离线检查（可选但建议）
@@ -161,6 +185,7 @@ cd /home/icrlab/tactile_work_Wy/lerobot
 
 - `real_test/results/realtime_latency.csv`
 - `real_test/results/realtime_actions.csv`
+- `real_test/results/realtime_observation.csv`
 
 终端键盘控制：
 
@@ -197,6 +222,7 @@ cd /home/icrlab/tactile_work_Wy/lerobot
 
 - `real_test/results/visualization/realtime_summary.json`
 - `real_test/results/visualization/realtime_dashboard.png`（若安装了 matplotlib）
+- `real_test/results/visualization/state_action_compare.png`（若有 `realtime_observation.csv`）
 
 新增关键监控字段（在 `realtime_latency.csv` 和 summary 中可见）：
 

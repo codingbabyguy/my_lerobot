@@ -1,7 +1,7 @@
 {
   "project": {
     "name": "pusht27_diffusion_v2_real_test",
-    "date": "2026-03-28"
+    "date": "2026-04-02"
   },
   "dataset": {
     "repo_id": "icrlab/pushT_batch8",
@@ -19,7 +19,8 @@
     "keyboard_enabled": true,
     "max_steps": 5,
     "latency_log_csv": "/home/icrlab/tactile_work_Wy/lerobot/real_test/results/realtime_latency.csv",
-    "action_log_csv": "/home/icrlab/tactile_work_Wy/lerobot/real_test/results/realtime_actions.csv"
+    "action_log_csv": "/home/icrlab/tactile_work_Wy/lerobot/real_test/results/realtime_actions.csv",
+    "observation_log_csv": "/home/icrlab/tactile_work_Wy/lerobot/real_test/results/realtime_observation.csv"
   },
   "estop": {
     "enabled": true,
@@ -38,7 +39,7 @@
       "rot6d_5",
       "gripper"
     ],
-    "coordinate_frame": "robot_base",
+    "coordinate_frame": "manual_relative_frame",
     "position_unit": "meter",
     "rotation_representation": "rot6d",
     "gripper_unit": "normalized"
@@ -104,9 +105,12 @@
         [-0.002141541, 0.005414721, 0.999983047],
         [0.979056838, 0.203584674, 0.000994353]
       ],
-      "xyz_mean": [-0.02410445963390505, -0.11140210878795122, 0.12321713878896841],
-      "xyz_std": [0.013169990073738072, 0.1302399919023768, 0.03226232959912836],
-      "workspace_clip_in_adapter": true,
+      "policy_frame": "manual_relative_frame",
+      "use_sdk_pose_transform": true,
+      "lock_work_tool_frame": true,
+      "expected_work_frame_names": [],
+      "expected_tool_frame_names": [],
+      "workspace_clip_in_adapter": false,
       "disable_gripper_control": true,
       "observation_gripper_value": 0.0,
       "camera_api": "auto",

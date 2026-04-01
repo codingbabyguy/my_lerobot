@@ -8,6 +8,12 @@ import sys
 from pathlib import Path
 
 
+def _normalize(name: str | None) -> str:
+    if name is None:
+        return ""
+    return str(name).replace("\x00", "").strip().lower()
+
+
 def _load_json(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -20,10 +26,18 @@ def main() -> None:
         type=str,
         default="/home/icrlab/tactile_work_Wy/lerobot/real_test/config/deployment_config.json",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero when current work/tool frame does not match config expected names",
+    )
     args = parser.parse_args()
 
     cfg = _load_json(args.config)
     robot_cfg = cfg["robot_adapter"]["config"]
+    lock_frame = bool(robot_cfg.get("lock_work_tool_frame", True))
+    expected_work = [_normalize(x) for x in robot_cfg.get("expected_work_frame_names", []) if str(x).strip()]
+    expected_tool = [_normalize(x) for x in robot_cfg.get("expected_tool_frame_names", []) if str(x).strip()]
 
     sdk_src = Path(robot_cfg["sdk_src_path"]).expanduser().resolve()
     if str(sdk_src) not in sys.path:
@@ -46,6 +60,12 @@ def main() -> None:
         ret_work, work = robot.rm_get_current_work_frame()
         ret_tool, tool = robot.rm_get_current_tool_frame()
         work_names = robot.rm_get_total_work_frame()
+        tool_names = robot.rm_get_total_tool_frame()
+
+        current_work_name = _normalize(work.get("name") if isinstance(work, dict) else None)
+        current_tool_name = _normalize(tool.get("name") if isinstance(tool, dict) else None)
+        work_match = (not expected_work) or (current_work_name in expected_work)
+        tool_match = (not expected_tool) or (current_tool_name in expected_tool)
 
         print(f"arm_state_ret: {ret_state}")
         print(f"arm_pose: {state.get('pose')}")
@@ -60,10 +80,27 @@ def main() -> None:
         print("all_work_frames:")
         print(json.dumps(work_names, indent=2, ensure_ascii=False))
         print()
+        print("all_tool_frames:")
+        print(json.dumps(tool_names, indent=2, ensure_ascii=False))
+        print()
+        print("frame_lock_config:")
+        print(f"  lock_work_tool_frame: {lock_frame}")
+        print(f"  expected_work_frame_names: {expected_work}")
+        print(f"  expected_tool_frame_names: {expected_tool}")
+        print(f"  current_work_frame_name: {current_work_name}")
+        print(f"  current_tool_frame_name: {current_tool_name}")
+        print(f"  work_match: {work_match}")
+        print(f"  tool_match: {tool_match}")
+        print()
         print("checklist:")
-        print("1. If current work frame is not the default/base frame, do not assume state['pose'] is already the training frame.")
-        print("2. If tool frame is not the same TCP definition used in data collection, current pose will not match training semantics.")
-        print("3. Move the arm by a small +X command and verify the physical motion matches your expected base-frame X direction.")
+        print("1. Training and inference should use the same manual_relative_frame.")
+        print("2. If current work/tool frame differs from config expected names, pose semantics can drift.")
+        print("3. Move arm by a small +X action in policy frame and verify physical direction against calibration.")
+        if args.strict and (not work_match or not tool_match):
+            raise RuntimeError(
+                "Frame check failed in strict mode: "
+                f"work_match={work_match}, tool_match={tool_match}"
+            )
     finally:
         robot.rm_delete_robot_arm()
 
