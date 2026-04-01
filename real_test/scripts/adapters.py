@@ -562,15 +562,11 @@ class GermanArmAdapter(BaseRobotAdapter):
             if ret != 0:
                 raise RuntimeError(f"send_action failed: rm_movep_canfd={ret}")
 
-        gripper = float(np.clip(action["gripper"], 0.0, 1.0))
-        g_min = int(self.robot_cfg.get("gripper_min", 1))
-        g_max = int(self.robot_cfg.get("gripper_max", 1000))
-        g_pos = int(round(g_min + gripper * (g_max - g_min)))
-        g_block = bool(self.robot_cfg.get("gripper_block", False))
-        g_timeout = int(self.robot_cfg.get("gripper_timeout_s", 0))
-        g_ret = self._robot.rm_set_gripper_position(g_pos, g_block, g_timeout)
-        if g_ret == 0:
-            self._last_gripper = gripper
+        # First-stage real robot validation keeps gripper control disabled.
+        # We still track a stable normalized value for observation.state.
+        gripper = float(action.get("gripper", self._last_gripper))
+        if np.isfinite(gripper):
+            self._last_gripper = float(np.clip(gripper, 0.0, 1.0))
 
     def wait_until_action_complete(self, timeout_s: float) -> bool:
         if not self.connected or self._robot is None:
