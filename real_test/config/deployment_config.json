@@ -80,7 +80,7 @@
     "name": "german_arm",
     "dry_run": true,
     "config": {
-      "sdk_src_path": "/home/icrlab/tactile_work_Wy/RM_API2/Demo/RMDemo_Python/RMDemo_SimpleProcess/src",
+      "sdk_src_path": "/home/icrlab/tactile_work_Wy/lerobot/real_test/RM_API2/Demo/RMDemo_Python/RMDemo_SimpleProcess/src",
       "host": "192.168.1.18",
       "port": 8080,
       "level": 3,
