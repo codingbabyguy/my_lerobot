@@ -105,6 +105,7 @@ def main() -> None:
     max_steps = int(cfg["control"]["max_steps"])
     execution_mode = str(cfg["control"].get("execution_mode", "serial")).lower()
     action_wait_timeout_s = float(cfg["control"].get("action_wait_timeout_s", 3.0))
+    debug_print_steps = int(cfg["control"].get("debug_print_steps", 3))
 
     latency_csv = cfg["control"]["latency_log_csv"]
     action_csv = cfg["control"]["action_log_csv"]
@@ -318,6 +319,12 @@ def main() -> None:
             )
             _append_csv(action_csv, [step, *[f"{x:.8f}" for x in safe_action.tolist()]])
             keyboard.clear_last_key()
+
+            if step < debug_print_steps:
+                raw_action_str = ", ".join(f"{name}={raw_action[i]:.6f}" for i, name in enumerate(action_names))
+                safe_action_str = ", ".join(f"{name}={safe_action[i]:.6f}" for i, name in enumerate(action_names))
+                print(f"[DEBUG step={step}] raw_action: {raw_action_str}")
+                print(f"[DEBUG step={step}] safe_action: {safe_action_str}")
 
             if step % 10 == 0:
                 print(
