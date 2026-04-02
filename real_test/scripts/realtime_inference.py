@@ -394,6 +394,10 @@ def main() -> None:
 
     cfg = _load_json(args.config)
     action_names = cfg["action_schema"]["names"]
+    startup_cfg = cfg.get("startup_pose", {})
+    if not isinstance(startup_cfg, dict):
+        startup_cfg = {}
+    map_startup_to_policy_origin = bool(startup_cfg.get("map_startup_to_policy_origin", True))
 
     target_hz = float(cfg["control"]["target_hz"])
     target_dt = 1.0 / target_hz
@@ -443,10 +447,16 @@ def main() -> None:
         max_xyz_speed_mps=float(cfg["safety"]["max_xyz_speed_mps"]),
         max_rot_delta_rad=float(cfg["safety"]["max_rot_delta_rad"]),
         max_gripper_delta_per_step=float(cfg["safety"]["max_gripper_delta_per_step"]),
-        clip_workspace_in_action_space=not bool(
-            cfg["robot_adapter"]["config"].get("workspace_clip_in_adapter", False)
+        clip_workspace_in_action_space=(
+            not bool(cfg["robot_adapter"]["config"].get("workspace_clip_in_adapter", False))
+            and (not map_startup_to_policy_origin)
         ),
     )
+    if map_startup_to_policy_origin:
+        print(
+            "[INFO] startup anchor mapping is enabled: disable policy-space workspace clip "
+            "to avoid clipping against absolute workspace bounds."
+        )
     safety_filter = ActionSafetyFilter(safety_cfg, action_names)
     estop = EStop(cfg["estop"]["enabled"], cfg["estop"]["trigger_file"])
     keyboard = KeyboardController(enabled=bool(cfg["control"].get("keyboard_enabled", True)))
@@ -513,9 +523,6 @@ def main() -> None:
     adapter.connect()
     keyboard.start()
     pause_applied = False
-    startup_cfg = cfg.get("startup_pose", {})
-    if not isinstance(startup_cfg, dict):
-        startup_cfg = {}
     try:
         use_startup_anchor = bool(startup_cfg.get("map_startup_to_policy_origin", True))
         startup_enabled = bool(startup_cfg.get("enabled", True))

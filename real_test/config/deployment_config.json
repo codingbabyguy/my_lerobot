@@ -77,6 +77,24 @@
     "simplified_task_rounds": 10,
     "log_jsonl": "/home/icrlab/tactile_work_Wy/lerobot/real_test/results/real_test_protocol.jsonl"
   },
+  "startup_pose": {
+    "enabled": true,
+    "mode": "safe_positive",
+    "xyz": [0.07, 0.035, 0.063],
+    "map_startup_to_policy_origin": true,
+    "keep_current_rotation": true,
+    "joint_speed": 6,
+    "max_joint_step_deg": 0.8,
+    "joint_tol_deg": 0.8,
+    "joint_limit_margin_deg": 10.0,
+    "wait_timeout_s": 4.0,
+    "max_timeout_streak": 2,
+    "require_algo_checks": true,
+    "disable_self_collision_check": false,
+    "disable_singularity_check": false,
+    "joint_poll_dt_s": 0.02,
+    "max_steps": 240
+  },
   "robot_adapter": {
     "name": "german_arm",
     "dry_run": false,
