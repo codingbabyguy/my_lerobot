@@ -93,6 +93,36 @@ def _format_joint(v: np.ndarray) -> str:
     return np.array2string(np.asarray(v, dtype=np.float64), precision=3, suppress_small=False)
 
 
+def _positive_xyz_from_workspace_bounds(
+    workspace_bounds: dict[str, list[float]] | None,
+    current_xyz: np.ndarray,
+) -> np.ndarray:
+    if not isinstance(workspace_bounds, dict):
+        raise ValueError("workspace_bounds is required for safe_positive target mode.")
+
+    out = np.asarray(current_xyz, dtype=np.float64).copy()
+    for idx, axis in enumerate(("x", "y", "z")):
+        bounds = workspace_bounds.get(axis)
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+            raise ValueError(f"workspace_bounds.{axis} is invalid for safe_positive mode: {bounds}")
+        low = float(bounds[0])
+        high = float(bounds[1])
+        if high <= 0.0:
+            raise ValueError(
+                f"workspace_bounds.{axis} has no positive range: low={low}, high={high}. "
+                "Cannot build xyz>0 startup target."
+            )
+        low_pos = max(0.0, low)
+        span = high - low_pos
+        if span <= 1e-8:
+            out[idx] = low_pos
+        else:
+            # Pick a conservative inner point in positive half-space.
+            out[idx] = low_pos + 0.35 * span
+        out[idx] = float(max(out[idx], 1e-4))
+    return out
+
+
 def _safe_dof(robot: object, fallback: int = 7) -> int:
     dof = int(getattr(robot, "arm_dof", 0) or 0)
     return dof if dof > 0 else int(fallback)
@@ -243,8 +273,33 @@ def main() -> None:
         type=str,
         default="/home/icrlab/tactile_work_Wy/lerobot/real_test/config/deployment_config.generated.json",
     )
-    parser.add_argument("--episode-index", type=int, required=True, help="Dataset episode index")
-    parser.add_argument("--step", type=int, default=0, help="Step inside episode")
+    parser.add_argument(
+        "--target-mode",
+        type=str,
+        choices=["safe_positive", "dataset", "config"],
+        default="safe_positive",
+        help="How to choose startup target state.",
+    )
+    parser.add_argument("--episode-index", type=int, default=0, help="Dataset episode index for target-mode=dataset")
+    parser.add_argument("--step", type=int, default=0, help="Step inside episode for target-mode=dataset")
+    parser.add_argument(
+        "--target-xyz",
+        type=float,
+        nargs=3,
+        default=None,
+        help="Manual-relative startup xyz override (meters).",
+    )
+    parser.add_argument(
+        "--target-gripper",
+        type=float,
+        default=None,
+        help="Startup gripper override in [0,1].",
+    )
+    parser.add_argument(
+        "--keep-current-rotation",
+        action="store_true",
+        help="Keep current end-effector orientation when building startup target.",
+    )
     parser.add_argument(
         "--max-pos-step-m",
         type=float,
@@ -384,29 +439,20 @@ def main() -> None:
             "[x,y,z,rot6d_0..5,gripper]."
         )
 
-    dataset = LeRobotDataset(cfg["dataset"]["repo_id"], root=cfg["dataset"]["root"])
-    ep_from, ep_to = _resolve_episode_bounds(dataset, int(args.episode_index))
-    dataset_idx = ep_from + int(args.step)
-    if dataset_idx >= ep_to:
-        raise ValueError(f"step out of range for episode {args.episode_index}: {args.step}")
-
-    row = dataset.hf_dataset.with_format(None)[dataset_idx]
-    target_state = np.asarray(row["observation.state"], dtype=np.float64).reshape(-1)
-    if target_state.shape[0] != 10:
-        raise ValueError(f"Target state must be 10D, got {target_state.shape}")
-
     adapter = make_robot_adapter(
         cfg["robot_adapter"]["name"],
         cfg["robot_adapter"]["config"],
         dry_run=bool(cfg["robot_adapter"].get("dry_run", False)),
     )
 
+    dataset_idx: int | None = None
+    row_frame_index: int | None = None
+
     report: dict = {
         "config": str(Path(args.config).expanduser().resolve()),
+        "target_mode": str(args.target_mode),
         "episode_index": int(args.episode_index),
         "step": int(args.step),
-        "dataset_index": int(dataset_idx),
-        "target_state": target_state.tolist(),
     }
 
     adapter.connect()
@@ -415,6 +461,69 @@ def main() -> None:
         current_state = np.asarray(cur_obs["observation.state"], dtype=np.float64).reshape(-1)
         if current_state.shape[0] != 10:
             raise ValueError(f"Current state must be 10D, got {current_state.shape}")
+
+        startup_cfg = cfg.get("startup_pose", {})
+        if not isinstance(startup_cfg, dict):
+            startup_cfg = {}
+
+        target_state = current_state.copy()
+        target_source = ""
+        if str(args.target_mode) == "dataset":
+            dataset = LeRobotDataset(cfg["dataset"]["repo_id"], root=cfg["dataset"]["root"])
+            ep_from, ep_to = _resolve_episode_bounds(dataset, int(args.episode_index))
+            dataset_idx = ep_from + int(args.step)
+            if dataset_idx >= ep_to:
+                raise ValueError(f"step out of range for episode {args.episode_index}: {args.step}")
+            row = dataset.hf_dataset.with_format(None)[dataset_idx]
+            target_state = np.asarray(row["observation.state"], dtype=np.float64).reshape(-1)
+            if target_state.shape[0] != 10:
+                raise ValueError(f"Target state must be 10D, got {target_state.shape}")
+            row_frame_index = int(row["frame_index"])
+            target_source = f"dataset(ep={int(args.episode_index)}, step={int(args.step)}, idx={int(dataset_idx)})"
+        else:
+            if args.target_xyz is not None:
+                xyz = np.asarray(args.target_xyz, dtype=np.float64).reshape(3)
+                target_source = "cli_target_xyz"
+            elif "xyz" in startup_cfg and isinstance(startup_cfg["xyz"], (list, tuple)) and len(startup_cfg["xyz"]) == 3:
+                xyz = np.asarray(startup_cfg["xyz"], dtype=np.float64).reshape(3)
+                target_source = "config.startup_pose.xyz"
+            elif str(args.target_mode) == "safe_positive":
+                xyz = _positive_xyz_from_workspace_bounds(cfg["safety"].get("workspace_bounds"), current_state[:3])
+                target_source = "safe_positive_from_workspace_bounds"
+            else:
+                raise ValueError(
+                    "target-mode=config requires startup_pose.xyz in config or --target-xyz on CLI."
+                )
+
+            keep_rot = bool(args.keep_current_rotation) or bool(startup_cfg.get("keep_current_rotation", True))
+            if keep_rot:
+                rot6d = current_state[3:9].copy()
+            else:
+                rot6d_cfg = startup_cfg.get("rot6d")
+                if isinstance(rot6d_cfg, (list, tuple)) and len(rot6d_cfg) == 6:
+                    rot6d = np.asarray(rot6d_cfg, dtype=np.float64).reshape(6)
+                else:
+                    rot6d = current_state[3:9].copy()
+
+            if args.target_gripper is not None:
+                gripper = float(args.target_gripper)
+            elif "gripper" in startup_cfg:
+                gripper = float(startup_cfg.get("gripper", current_state[9]))
+            else:
+                gripper = float(current_state[9])
+            gripper = float(np.clip(gripper, 0.0, 1.0))
+
+            target_state = np.concatenate([xyz, rot6d, np.array([gripper], dtype=np.float64)], axis=0)
+
+        if str(args.target_mode) == "safe_positive" and np.any(target_state[:3] <= 0.0):
+            raise RuntimeError(
+                f"safe_positive mode requires xyz > 0, got target xyz={target_state[:3].tolist()}"
+            )
+
+        report["target_source"] = target_source
+        report["dataset_index"] = int(dataset_idx) if dataset_idx is not None else None
+        report["dataset_frame_index"] = int(row_frame_index) if row_frame_index is not None else None
+        report["target_state"] = target_state.tolist()
 
         pos0 = current_state[:3]
         pos1 = target_state[:3]
@@ -427,7 +536,12 @@ def main() -> None:
         rot_dist = _rotation_geodesic_distance(r0, r1)
         g_dist = abs(g1 - g0)
 
-        print(f"[INFO] dataset idx={dataset_idx} episode={args.episode_index} frame={int(row['frame_index'])}")
+        if dataset_idx is not None:
+            print(
+                f"[INFO] dataset idx={dataset_idx} episode={args.episode_index} "
+                f"frame={row_frame_index}"
+            )
+        print(f"[INFO] target_source={target_source}")
         print(f"[INFO] camera_source={adapter.camera_source()}")
         print(f"[INFO] current xyz={_format_vec(pos0)}")
         print(f"[INFO] target  xyz={_format_vec(pos1)}")

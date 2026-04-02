@@ -56,6 +56,24 @@ def merge_config(base_cfg: dict, template_cfg: dict) -> dict:
     out.setdefault("control", {})
     out["control"].setdefault("observation_log_csv", _default_observation_log_csv(out["control"].get("action_log_csv")))
 
+    out.setdefault("startup_pose", {})
+    startup = out["startup_pose"]
+    startup.setdefault("enabled", True)
+    startup.setdefault("mode", "safe_positive")
+    startup.setdefault("map_startup_to_policy_origin", True)
+    startup.setdefault("keep_current_rotation", True)
+    startup.setdefault("joint_speed", 6)
+    startup.setdefault("max_joint_step_deg", 0.8)
+    startup.setdefault("joint_tol_deg", 0.8)
+    startup.setdefault("joint_limit_margin_deg", 10.0)
+    startup.setdefault("wait_timeout_s", 4.0)
+    startup.setdefault("max_timeout_streak", 2)
+    startup.setdefault("require_algo_checks", True)
+    startup.setdefault("disable_self_collision_check", False)
+    startup.setdefault("disable_singularity_check", False)
+    startup.setdefault("joint_poll_dt_s", 0.02)
+    startup.setdefault("max_steps", 240)
+
     return out
 
 
