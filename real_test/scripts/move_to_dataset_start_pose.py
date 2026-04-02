@@ -515,9 +515,9 @@ def main() -> None:
 
             target_state = np.concatenate([xyz, rot6d, np.array([gripper], dtype=np.float64)], axis=0)
 
-        if str(args.target_mode) == "safe_positive" and np.any(target_state[:3] <= 0.0):
+        if str(args.target_mode) == "safe_positive" and np.any(target_state[:3] < 0.0):
             raise RuntimeError(
-                f"safe_positive mode requires xyz > 0, got target xyz={target_state[:3].tolist()}"
+                f"safe_positive mode requires xyz >= 0, got target xyz={target_state[:3].tolist()}"
             )
 
         report["target_source"] = target_source
