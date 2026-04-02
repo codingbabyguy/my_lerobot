@@ -81,6 +81,7 @@
     "enabled": true,
     "mode": "safe_positive",
     "xyz": [0.07, 0.0, 0.07],
+    "xyz_frame": "base",
     "map_startup_to_policy_origin": true,
     "keep_current_rotation": true,
     "joint_speed": 6,
