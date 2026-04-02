@@ -41,7 +41,6 @@ from move_to_dataset_start_pose import (
     _safe_dof,
     _to_len7_joint,
     _wait_joint_close,
-    _xyz_in_frame_to_manual,
 )
 
 
@@ -204,8 +203,6 @@ def _map_state_policy_to_adapter(
 def _build_startup_target_state(
     cfg: dict,
     current_state: np.ndarray,
-    manual_origin_base: np.ndarray,
-    manual_rotation_base: np.ndarray,
 ) -> tuple[np.ndarray, str]:
     startup_cfg = cfg.get("startup_pose", {})
     if not isinstance(startup_cfg, dict):
@@ -219,15 +216,8 @@ def _build_startup_target_state(
         return target, "startup_disabled"
 
     if "xyz" in startup_cfg and isinstance(startup_cfg["xyz"], (list, tuple)) and len(startup_cfg["xyz"]) == 3:
-        xyz_src = np.asarray(startup_cfg["xyz"], dtype=np.float64).reshape(3)
-        xyz_frame = str(startup_cfg.get("xyz_frame", "manual")).lower()
-        xyz = _xyz_in_frame_to_manual(
-            xyz_src,
-            frame=xyz_frame,
-            manual_origin_base=manual_origin_base,
-            manual_rotation_base=manual_rotation_base,
-        )
-        source = f"startup_pose.xyz({xyz_frame})"
+        xyz = np.asarray(startup_cfg["xyz"], dtype=np.float64).reshape(3)
+        source = "startup_pose.xyz"
     elif mode == "safe_positive":
         xyz = _positive_xyz_from_workspace_bounds(cfg["safety"].get("workspace_bounds"), current_state[:3])
         source = "safe_positive_from_workspace_bounds"
@@ -543,18 +533,7 @@ def main() -> None:
                 raise RuntimeError(
                     f"Invalid startup observation.state shape: expected {len(action_names)}, got {startup_state.shape[0]}"
                 )
-            target_state, target_source = _build_startup_target_state(
-                cfg,
-                startup_state,
-                manual_origin_base=np.asarray(
-                    getattr(adapter, "_manual_origin_base", np.zeros(3, dtype=np.float64)),
-                    dtype=np.float64,
-                ).reshape(3),
-                manual_rotation_base=np.asarray(
-                    getattr(adapter, "_manual_rotation_base", np.eye(3, dtype=np.float64)),
-                    dtype=np.float64,
-                ).reshape(3, 3),
-            )
+            target_state, target_source = _build_startup_target_state(cfg, startup_state)
             print(f"[STARTUP] source={target_source}")
             print(f"[STARTUP] current xyz={startup_state[:3].tolist()}")
             print(f"[STARTUP] target  xyz={target_state[:3].tolist()}")

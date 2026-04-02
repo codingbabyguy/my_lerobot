@@ -61,7 +61,6 @@ def merge_config(base_cfg: dict, template_cfg: dict) -> dict:
     startup.setdefault("enabled", True)
     startup.setdefault("mode", "safe_positive")
     startup.setdefault("xyz", [0.07, 0.0, 0.07])
-    startup.setdefault("xyz_frame", "base")
     startup.setdefault("map_startup_to_policy_origin", True)
     startup.setdefault("keep_current_rotation", True)
     startup.setdefault("joint_speed", 6)

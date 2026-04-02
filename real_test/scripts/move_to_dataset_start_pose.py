@@ -123,22 +123,6 @@ def _positive_xyz_from_workspace_bounds(
     return out
 
 
-def _xyz_in_frame_to_manual(
-    xyz: np.ndarray,
-    *,
-    frame: str,
-    manual_origin_base: np.ndarray,
-    manual_rotation_base: np.ndarray,
-) -> np.ndarray:
-    xyz = np.asarray(xyz, dtype=np.float64).reshape(3)
-    frame_norm = str(frame).strip().lower()
-    if frame_norm in ("manual", "policy", "manual_relative_frame"):
-        return xyz.copy()
-    if frame_norm == "base":
-        return manual_rotation_base.T @ (xyz - manual_origin_base)
-    raise ValueError(f"Unsupported xyz frame: {frame!r}. Expected 'manual' or 'base'.")
-
-
 def _safe_dof(robot: object, fallback: int = 7) -> int:
     dof = int(getattr(robot, "arm_dof", 0) or 0)
     return dof if dof > 0 else int(fallback)
@@ -303,14 +287,7 @@ def main() -> None:
         type=float,
         nargs=3,
         default=None,
-        help="Startup xyz override (meters). Frame is controlled by --target-xyz-frame.",
-    )
-    parser.add_argument(
-        "--target-xyz-frame",
-        type=str,
-        choices=["manual", "base"],
-        default=None,
-        help="Coordinate frame for --target-xyz. Default follows startup_pose.xyz_frame (or manual).",
+        help="Startup xyz override in manual_relative_frame (meters).",
     )
     parser.add_argument(
         "--target-gripper",
@@ -505,25 +482,11 @@ def main() -> None:
             target_source = f"dataset(ep={int(args.episode_index)}, step={int(args.step)}, idx={int(dataset_idx)})"
         else:
             if args.target_xyz is not None:
-                xyz_src = np.asarray(args.target_xyz, dtype=np.float64).reshape(3)
-                xyz_frame = str(args.target_xyz_frame or startup_cfg.get("xyz_frame", "manual")).lower()
-                xyz = _xyz_in_frame_to_manual(
-                    xyz_src,
-                    frame=xyz_frame,
-                    manual_origin_base=adapter._manual_origin_base,
-                    manual_rotation_base=adapter._manual_rotation_base,
-                )
-                target_source = f"cli_target_xyz({xyz_frame})"
+                xyz = np.asarray(args.target_xyz, dtype=np.float64).reshape(3)
+                target_source = "cli_target_xyz"
             elif "xyz" in startup_cfg and isinstance(startup_cfg["xyz"], (list, tuple)) and len(startup_cfg["xyz"]) == 3:
-                xyz_src = np.asarray(startup_cfg["xyz"], dtype=np.float64).reshape(3)
-                xyz_frame = str(startup_cfg.get("xyz_frame", "manual")).lower()
-                xyz = _xyz_in_frame_to_manual(
-                    xyz_src,
-                    frame=xyz_frame,
-                    manual_origin_base=adapter._manual_origin_base,
-                    manual_rotation_base=adapter._manual_rotation_base,
-                )
-                target_source = f"config.startup_pose.xyz({xyz_frame})"
+                xyz = np.asarray(startup_cfg["xyz"], dtype=np.float64).reshape(3)
+                target_source = "config.startup_pose.xyz"
             elif str(args.target_mode) == "safe_positive":
                 xyz = _positive_xyz_from_workspace_bounds(cfg["safety"].get("workspace_bounds"), current_state[:3])
                 target_source = "safe_positive_from_workspace_bounds"
