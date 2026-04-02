@@ -760,12 +760,24 @@ class GermanArmAdapter(BaseRobotAdapter):
         poll_dt = float(self.robot_cfg.get("completion_poll_dt_s", 0.02))
         pose_tol = float(self.robot_cfg.get("completion_pose_tol_m", 0.005))
         rot_tol = float(self.robot_cfg.get("completion_rot_tol_rad", 0.08))
+        stable_polls = int(self.robot_cfg.get("completion_stable_polls", 3))
+        stable_polls = max(stable_polls, 1)
+        min_settle_s = float(self.robot_cfg.get("completion_min_settle_s", 0.08))
         t_end = time.perf_counter() + timeout_s
+        t_start = time.perf_counter()
         target_pose = self._last_target_pose_base
+        within_tol_streak = 0
 
         while time.perf_counter() < t_end:
-            traj = self._robot.rm_get_arm_current_trajectory()
-            traj_type = int(traj.get("trajectory_type", 1))
+            traj_type = None
+            traj_valid = False
+            try:
+                traj = self._robot.rm_get_arm_current_trajectory()
+                if isinstance(traj, dict) and "trajectory_type" in traj:
+                    traj_type = int(traj["trajectory_type"])
+                    traj_valid = True
+            except Exception:
+                traj_valid = False
 
             if target_pose is not None:
                 try:
@@ -780,9 +792,23 @@ class GermanArmAdapter(BaseRobotAdapter):
                 else:
                     pos_err = float("inf")
                     rot_err = float("inf")
-                if traj_type == 0 and pos_err <= pose_tol and rot_err <= rot_tol:
+
+                if pos_err <= pose_tol and rot_err <= rot_tol:
+                    within_tol_streak += 1
+                else:
+                    within_tol_streak = 0
+
+                # Prefer robust pose-convergence check because some RM SDK builds
+                # intermittently fail rm_get_arm_current_trajectory.
+                if (
+                    within_tol_streak >= stable_polls
+                    and (time.perf_counter() - t_start) >= min_settle_s
+                ):
                     return True
-            elif traj_type == 0:
+
+                if traj_valid and traj_type == 0 and pos_err <= pose_tol and rot_err <= rot_tol:
+                    return True
+            elif traj_valid and traj_type == 0:
                 return True
 
             time.sleep(poll_dt)

@@ -118,6 +118,34 @@ def main() -> None:
         default=3.0,
         help="Wait timeout for each interpolated command.",
     )
+    parser.add_argument(
+        "--max-timeout-streak",
+        type=int,
+        default=2,
+        help="Abort when consecutive wait timeouts exceed this value.",
+    )
+    parser.add_argument(
+        "--max-initial-pos-dist-m",
+        type=float,
+        default=0.35,
+        help="Safety gate: abort if initial distance to target exceeds this value (m).",
+    )
+    parser.add_argument(
+        "--max-initial-rot-dist-rad",
+        type=float,
+        default=1.2,
+        help="Safety gate: abort if initial rotation distance exceeds this value (rad).",
+    )
+    parser.add_argument(
+        "--allow-large-move",
+        action="store_true",
+        help="Override initial distance safety gate.",
+    )
+    parser.add_argument(
+        "--simultaneous-pose-rot",
+        action="store_true",
+        help="Move translation and rotation simultaneously (default is safer two-stage move).",
+    )
     parser.add_argument("--max-steps", type=int, default=300, help="Max interpolation steps.")
     parser.add_argument(
         "--accept-pos-err-m",
@@ -202,54 +230,119 @@ def main() -> None:
         rot_dist = _rotation_geodesic_distance(r0, r1)
         g_dist = abs(g1 - g0)
 
-        n_pos = int(math.ceil(pos_dist / max(float(args.max_pos_step_m), 1e-6)))
-        n_rot = int(math.ceil(rot_dist / max(float(args.max_rot_step_rad), 1e-6)))
-        n_gri = int(math.ceil(g_dist / 0.02))
-        n_steps = max(1, n_pos, n_rot, n_gri)
-        if n_steps > int(args.max_steps):
-            print(f"[WARN] planned steps {n_steps} > max_steps {args.max_steps}, truncating.")
-            n_steps = int(args.max_steps)
-
         print(f"[INFO] dataset idx={dataset_idx} episode={args.episode_index} frame={int(row['frame_index'])}")
         print(f"[INFO] camera_source={adapter.camera_source()}")
         print(f"[INFO] current xyz={_format_vec(pos0)}")
         print(f"[INFO] target  xyz={_format_vec(pos1)}")
         print(f"[INFO] pos_dist={pos_dist:.6f} m, rot_dist={rot_dist:.6f} rad, gripper_dist={g_dist:.6f}")
-        print(f"[INFO] interpolation steps={n_steps}")
+
+        if (pos_dist > float(args.max_initial_pos_dist_m) or rot_dist > float(args.max_initial_rot_dist_rad)) and (
+            not bool(args.allow_large_move)
+        ):
+            raise RuntimeError(
+                "Initial gap is too large for automatic approach: "
+                f"pos_dist={pos_dist:.3f}m (limit={args.max_initial_pos_dist_m}), "
+                f"rot_dist={rot_dist:.3f}rad (limit={args.max_initial_rot_dist_rad}). "
+                "Please jog robot closer manually or rerun with --allow-large-move after safety confirmation."
+            )
+
+        if bool(args.simultaneous_pose_rot):
+            segments = [("pose+rot", pos0, r0, g0, pos1, r1, g1)]
+        else:
+            # Safer on real hardware: reduce coupled kinematic stress by translating first, then rotating in place.
+            segments = [
+                ("translate", pos0, r0, g0, pos1, r0, g0),
+                ("rotate", pos1, r0, g0, pos1, r1, g1),
+            ]
+
+        seg_specs: list[tuple[str, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray, float, int]] = []
+        total_planned_steps = 0
+        for name, s_pos, s_rot, s_g, e_pos, e_rot, e_g in segments:
+            seg_pos_dist = float(np.linalg.norm(e_pos - s_pos))
+            seg_rot_dist = _rotation_geodesic_distance(s_rot, e_rot)
+            seg_g_dist = abs(float(e_g) - float(s_g))
+            seg_n_pos = int(math.ceil(seg_pos_dist / max(float(args.max_pos_step_m), 1e-6)))
+            seg_n_rot = int(math.ceil(seg_rot_dist / max(float(args.max_rot_step_rad), 1e-6)))
+            seg_n_gri = int(math.ceil(seg_g_dist / 0.02))
+            seg_steps = max(1, seg_n_pos, seg_n_rot, seg_n_gri)
+            seg_specs.append((name, s_pos, s_rot, float(s_g), e_pos, e_rot, float(e_g), seg_steps))
+            total_planned_steps += seg_steps
+
+        print(
+            f"[INFO] motion_mode={'simultaneous' if args.simultaneous_pose_rot else 'position-first'} "
+            f"segments={len(seg_specs)} planned_steps={total_planned_steps} max_steps={int(args.max_steps)}"
+        )
 
         ok_count = 0
-        for i in range(1, n_steps + 1):
-            alpha = float(i / n_steps)
-            pos_i = (1.0 - alpha) * pos0 + alpha * pos1
-            r_i = _slerp_matrix(r0, r1, alpha)
-            rot6d_i = matrix_to_rot6d(r_i)
-            g_i = float((1.0 - alpha) * g0 + alpha * g1)
+        timeout_streak = 0
+        global_step = 0
+        max_steps = int(args.max_steps)
+        truncated = False
 
-            action = {
-                "x": float(pos_i[0]),
-                "y": float(pos_i[1]),
-                "z": float(pos_i[2]),
-                "rot6d_0": float(rot6d_i[0]),
-                "rot6d_1": float(rot6d_i[1]),
-                "rot6d_2": float(rot6d_i[2]),
-                "rot6d_3": float(rot6d_i[3]),
-                "rot6d_4": float(rot6d_i[4]),
-                "rot6d_5": float(rot6d_i[5]),
-                "gripper": float(g_i),
-            }
+        for seg_idx, (seg_name, s_pos, s_rot, s_g, e_pos, e_rot, e_g, seg_steps) in enumerate(seg_specs, start=1):
+            seg_pos_dist = float(np.linalg.norm(e_pos - s_pos))
+            seg_rot_dist = _rotation_geodesic_distance(s_rot, e_rot)
+            print(
+                f"[SEG {seg_idx}/{len(seg_specs)}] {seg_name} "
+                f"steps={seg_steps} pos_dist={seg_pos_dist:.6f} rot_dist={seg_rot_dist:.6f}"
+            )
+            for i in range(1, seg_steps + 1):
+                if global_step >= max_steps:
+                    truncated = True
+                    print(f"[WARN] reached max_steps={max_steps}, stop interpolation early.")
+                    break
 
-            t0 = time.perf_counter()
-            adapter.send_action(action)
-            done = adapter.wait_until_action_complete(float(args.wait_timeout_s))
-            dt = (time.perf_counter() - t0) * 1000.0
-            if done:
-                ok_count += 1
+                alpha = float(i / seg_steps)
+                pos_i = (1.0 - alpha) * s_pos + alpha * e_pos
+                r_i = _slerp_matrix(s_rot, e_rot, alpha)
+                rot6d_i = matrix_to_rot6d(r_i)
+                g_i = float((1.0 - alpha) * s_g + alpha * e_g)
 
-            if i <= 3 or i == n_steps or i % 10 == 0:
-                print(
-                    f"[STEP {i:03d}/{n_steps}] done={int(done)} "
-                    f"xyz={_format_vec(pos_i)} dt={dt:.1f}ms"
-                )
+                action = {
+                    "x": float(pos_i[0]),
+                    "y": float(pos_i[1]),
+                    "z": float(pos_i[2]),
+                    "rot6d_0": float(rot6d_i[0]),
+                    "rot6d_1": float(rot6d_i[1]),
+                    "rot6d_2": float(rot6d_i[2]),
+                    "rot6d_3": float(rot6d_i[3]),
+                    "rot6d_4": float(rot6d_i[4]),
+                    "rot6d_5": float(rot6d_i[5]),
+                    "gripper": float(g_i),
+                }
+
+                t0 = time.perf_counter()
+                adapter.send_action(action)
+                done = adapter.wait_until_action_complete(float(args.wait_timeout_s))
+                dt = (time.perf_counter() - t0) * 1000.0
+                global_step += 1
+                if done:
+                    ok_count += 1
+                    timeout_streak = 0
+                else:
+                    timeout_streak += 1
+                    print(
+                        f"[WARN] wait timeout at global_step {global_step}/{max_steps}, "
+                        f"segment={seg_name} step={i}/{seg_steps}, streak={timeout_streak}, dt={dt:.1f}ms"
+                    )
+                    if timeout_streak >= int(args.max_timeout_streak):
+                        try:
+                            adapter.stop_motion()
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            "Aborting due to consecutive action timeouts. "
+                            "Robot may be in protective stop / unreachable state."
+                        )
+
+                if global_step <= 3 or i == seg_steps or global_step % 10 == 0:
+                    print(
+                        f"[STEP {global_step:03d}/{max_steps}] done={int(done)} "
+                        f"seg={seg_name} xyz={_format_vec(pos_i)} dt={dt:.1f}ms"
+                    )
+
+            if truncated:
+                break
 
         final_obs = adapter.get_observation()
         final_state = np.asarray(final_obs["observation.state"], dtype=np.float64).reshape(-1)
@@ -267,7 +360,7 @@ def main() -> None:
             f"[RESULT] pos_err={pos_err:.6f}m rot_err={rot_err:.6f}rad "
             f"l2_err={l2_err:.6f} pass={passed}"
         )
-        print(f"[RESULT] wait_success={ok_count}/{n_steps}")
+        print(f"[RESULT] wait_success={ok_count}/{global_step}")
 
         report.update(
             {
@@ -275,7 +368,9 @@ def main() -> None:
                 "final_state": final_state.tolist(),
                 "pos_dist_before": pos_dist,
                 "rot_dist_before": rot_dist,
-                "planned_steps": int(n_steps),
+                "planned_steps": int(total_planned_steps),
+                "executed_steps": int(global_step),
+                "truncated_by_max_steps": bool(truncated),
                 "wait_success_count": int(ok_count),
                 "final_pos_err_m": pos_err,
                 "final_rot_err_rad": rot_err,
