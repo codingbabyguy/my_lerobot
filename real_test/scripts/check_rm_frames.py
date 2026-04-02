@@ -61,6 +61,12 @@ def main() -> None:
         ret_tool, tool = robot.rm_get_current_tool_frame()
         work_names = robot.rm_get_total_work_frame()
         tool_names = robot.rm_get_total_tool_frame()
+        ret_joint, joint_deg = robot.rm_get_joint_degree()
+        ret_jmin, joint_min = robot.rm_get_joint_min_pos()
+        ret_jmax, joint_max = robot.rm_get_joint_max_pos()
+        joint_err = robot.rm_get_joint_err_flag()
+        ret_collision, collision_mode = robot.rm_get_collision_detection()
+        ret_sing, avoid_sing_mode = robot.rm_get_avoid_singularity_mode()
 
         current_work_name = _normalize(work.get("name") if isinstance(work, dict) else None)
         current_tool_name = _normalize(tool.get("name") if isinstance(tool, dict) else None)
@@ -70,6 +76,13 @@ def main() -> None:
         print(f"arm_state_ret: {ret_state}")
         print(f"arm_pose: {state.get('pose')}")
         print(f"arm_state_keys: {list(state.keys())}")
+        print(f"joint_degree_ret: {ret_joint}")
+        print(f"joint_degree: {joint_deg}")
+        print(f"joint_min_ret: {ret_jmin}, joint_min: {joint_min}")
+        print(f"joint_max_ret: {ret_jmax}, joint_max: {joint_max}")
+        print(f"joint_err_flag: {json.dumps(joint_err, ensure_ascii=False)}")
+        print(f"collision_detection_ret: {ret_collision}, mode: {collision_mode}")
+        print(f"avoid_singularity_ret: {ret_sing}, mode: {avoid_sing_mode}")
         print()
         print(f"current_work_frame_ret: {ret_work}")
         print(json.dumps(work, indent=2, ensure_ascii=False))
@@ -95,7 +108,8 @@ def main() -> None:
         print("checklist:")
         print("1. Training and inference should use the same manual_relative_frame.")
         print("2. If current work/tool frame differs from config expected names, pose semantics can drift.")
-        print("3. Move arm by a small +X action in policy frame and verify physical direction against calibration.")
+        print("3. Verify joint_degree is not near joint_min/joint_max before automatic move-to-start.")
+        print("4. Move arm by a small +X action in policy frame and verify physical direction against calibration.")
         if args.strict and (not work_match or not tool_match):
             raise RuntimeError(
                 "Frame check failed in strict mode: "

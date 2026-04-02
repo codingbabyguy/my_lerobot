@@ -19,7 +19,7 @@ if str(SRC_DIR) not in sys.path:
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from adapters import make_robot_adapter
+from adapters import _matrix_to_euler_xyz, make_robot_adapter
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from safety import matrix_to_rot6d, rot6d_to_matrix
 
@@ -89,6 +89,151 @@ def _format_vec(v: np.ndarray) -> str:
     return np.array2string(np.asarray(v, dtype=np.float64), precision=6, suppress_small=False)
 
 
+def _format_joint(v: np.ndarray) -> str:
+    return np.array2string(np.asarray(v, dtype=np.float64), precision=3, suppress_small=False)
+
+
+def _safe_dof(robot: object, fallback: int = 7) -> int:
+    dof = int(getattr(robot, "arm_dof", 0) or 0)
+    return dof if dof > 0 else int(fallback)
+
+
+def _read_joint_degree(robot: object, dof: int) -> np.ndarray:
+    ret, joint = robot.rm_get_joint_degree()
+    if int(ret) != 0:
+        raise RuntimeError(f"rm_get_joint_degree failed with code {ret}")
+    arr = np.asarray(joint, dtype=np.float64).reshape(-1)
+    if arr.shape[0] < dof:
+        raise RuntimeError(f"rm_get_joint_degree returned insufficient length: {arr.shape[0]} < dof {dof}")
+    return arr[:dof].copy()
+
+
+def _read_joint_limits(robot: object, dof: int) -> tuple[np.ndarray, np.ndarray]:
+    ret_min, jmin = robot.rm_get_joint_min_pos()
+    ret_max, jmax = robot.rm_get_joint_max_pos()
+    if int(ret_min) != 0 or int(ret_max) != 0:
+        raise RuntimeError(f"failed to read joint limits: min_ret={ret_min}, max_ret={ret_max}")
+    min_arr = np.asarray(jmin, dtype=np.float64).reshape(-1)
+    max_arr = np.asarray(jmax, dtype=np.float64).reshape(-1)
+    if min_arr.shape[0] < dof or max_arr.shape[0] < dof:
+        raise RuntimeError(
+            f"joint limit length mismatch: min={min_arr.shape[0]}, max={max_arr.shape[0]}, dof={dof}"
+        )
+    return min_arr[:dof].copy(), max_arr[:dof].copy()
+
+
+def _to_len7_joint(q_deg: np.ndarray, dof: int) -> list[float]:
+    out = np.zeros(7, dtype=np.float64)
+    n = min(int(dof), 7, int(q_deg.shape[0]))
+    out[:n] = q_deg[:n]
+    return out.tolist()
+
+
+def _joint_health_summary(robot: object, dof: int) -> dict:
+    if not hasattr(robot, "rm_get_joint_err_flag"):
+        return {"available": False}
+    try:
+        info = robot.rm_get_joint_err_flag()
+    except Exception as exc:
+        return {"available": True, "error": str(exc)}
+    ret = int(info.get("return_code", -999))
+    err_flag = np.asarray(info.get("err_flag", []), dtype=np.int64).reshape(-1)
+    brake = np.asarray(info.get("brake_state", []), dtype=np.int64).reshape(-1)
+    err_flag = err_flag[:dof] if err_flag.size >= dof else err_flag
+    brake = brake[:dof] if brake.size >= dof else brake
+    return {
+        "available": True,
+        "return_code": ret,
+        "err_flag": err_flag.tolist(),
+        "brake_state": brake.tolist(),
+        "has_joint_err": bool(ret == 0 and err_flag.size > 0 and np.any(err_flag != 0)),
+    }
+
+
+def _wait_joint_close(
+    robot: object,
+    target_joint: np.ndarray,
+    timeout_s: float,
+    tol_deg: float,
+    poll_dt_s: float,
+) -> tuple[bool, np.ndarray, str]:
+    dof = int(target_joint.shape[0])
+    t_end = time.perf_counter() + float(max(timeout_s, 0.01))
+    last = target_joint.copy()
+    while time.perf_counter() < t_end:
+        try:
+            cur = _read_joint_degree(robot, dof)
+        except Exception:
+            cur = last
+        last = cur
+        max_abs = float(np.max(np.abs(cur - target_joint)))
+        if max_abs <= float(tol_deg):
+            return True, cur, "joint_close"
+
+        health = _joint_health_summary(robot, dof)
+        if bool(health.get("has_joint_err", False)):
+            return False, cur, f"joint_err_flag={health.get('err_flag')}"
+
+        time.sleep(float(max(poll_dt_s, 0.005)))
+    return False, last, "timeout"
+
+
+def _check_joint_safety(
+    robot: object,
+    q_deg: np.ndarray,
+    q_min_soft: np.ndarray,
+    q_max_soft: np.ndarray,
+    dof: int,
+    *,
+    enable_self_collision_check: bool,
+    enable_singularity_check: bool,
+    require_algo_checks: bool,
+) -> tuple[bool, list[str]]:
+    issues: list[str] = []
+    margin_low = q_deg - q_min_soft
+    margin_high = q_max_soft - q_deg
+    if np.any(margin_low < 0.0) or np.any(margin_high < 0.0):
+        bad = np.where((margin_low < 0.0) | (margin_high < 0.0))[0]
+        for idx in bad.tolist():
+            issues.append(
+                f"joint_limit_soft_violation:j{idx+1}:q={q_deg[idx]:.3f},"
+                f"min_soft={q_min_soft[idx]:.3f},max_soft={q_max_soft[idx]:.3f}"
+            )
+
+    if enable_self_collision_check and hasattr(robot, "rm_algo_safety_robot_self_collision_detection"):
+        try:
+            col = int(robot.rm_algo_safety_robot_self_collision_detection(_to_len7_joint(q_deg, dof)))
+            if col == 1:
+                issues.append("self_collision_detected")
+            elif col not in (0, 1):
+                msg = f"self_collision_check_unexpected_return={col}"
+                if require_algo_checks:
+                    issues.append(msg)
+                else:
+                    print(f"[WARN] {msg}")
+        except Exception as exc:
+            msg = f"self_collision_check_failed={exc}"
+            if require_algo_checks:
+                issues.append(msg)
+            else:
+                print(f"[WARN] {msg}")
+
+    if enable_singularity_check and dof == 6 and hasattr(robot, "rm_algo_kin_robot_singularity_analyse"):
+        try:
+            sing_ret, sing_dist = robot.rm_algo_kin_robot_singularity_analyse(q_deg[:6].tolist())
+            sing_ret = int(sing_ret)
+            if sing_ret != 0:
+                issues.append(f"singularity_detected:code={sing_ret},dist={float(sing_dist):.6f}")
+        except Exception as exc:
+            msg = f"singularity_check_failed={exc}"
+            if require_algo_checks:
+                issues.append(msg)
+            else:
+                print(f"[WARN] {msg}")
+
+    return len(issues) == 0, issues
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Move RM arm slowly to dataset initial pose in manual_relative_frame."
@@ -145,6 +290,58 @@ def main() -> None:
         "--simultaneous-pose-rot",
         action="store_true",
         help="Move translation and rotation simultaneously (default is safer two-stage move).",
+    )
+    parser.add_argument(
+        "--motion-space",
+        type=str,
+        choices=["joint", "cartesian"],
+        default="joint",
+        help="Planning space for moving to dataset start pose.",
+    )
+    parser.add_argument(
+        "--max-joint-step-deg",
+        type=float,
+        default=1.0,
+        help="Max per-step interpolation in joint space (deg) when motion-space=joint.",
+    )
+    parser.add_argument(
+        "--joint-speed",
+        type=int,
+        default=8,
+        help="rm_movej speed percent [1,100] when motion-space=joint.",
+    )
+    parser.add_argument(
+        "--joint-tol-deg",
+        type=float,
+        default=0.8,
+        help="Joint close tolerance for each interpolated step (deg).",
+    )
+    parser.add_argument(
+        "--joint-limit-margin-deg",
+        type=float,
+        default=8.0,
+        help="Soft margin away from RM joint hard limits (deg).",
+    )
+    parser.add_argument(
+        "--disable-self-collision-check",
+        action="store_true",
+        help="Disable SDK self-collision precheck in joint-space planner.",
+    )
+    parser.add_argument(
+        "--disable-singularity-check",
+        action="store_true",
+        help="Disable SDK singularity precheck in joint-space planner.",
+    )
+    parser.add_argument(
+        "--require-algo-checks",
+        action="store_true",
+        help="Fail if SDK algorithm checks are unavailable or error.",
+    )
+    parser.add_argument(
+        "--joint-poll-dt-s",
+        type=float,
+        default=0.02,
+        help="Polling interval for joint convergence wait.",
     )
     parser.add_argument("--max-steps", type=int, default=300, help="Max interpolation steps.")
     parser.add_argument(
@@ -236,84 +433,161 @@ def main() -> None:
         print(f"[INFO] target  xyz={_format_vec(pos1)}")
         print(f"[INFO] pos_dist={pos_dist:.6f} m, rot_dist={rot_dist:.6f} rad, gripper_dist={g_dist:.6f}")
 
-        if (pos_dist > float(args.max_initial_pos_dist_m) or rot_dist > float(args.max_initial_rot_dist_rad)) and (
-            not bool(args.allow_large_move)
-        ):
-            raise RuntimeError(
-                "Initial gap is too large for automatic approach: "
-                f"pos_dist={pos_dist:.3f}m (limit={args.max_initial_pos_dist_m}), "
-                f"rot_dist={rot_dist:.3f}rad (limit={args.max_initial_rot_dist_rad}). "
-                "Please jog robot closer manually or rerun with --allow-large-move after safety confirmation."
-            )
-
-        if bool(args.simultaneous_pose_rot):
-            segments = [("pose+rot", pos0, r0, g0, pos1, r1, g1)]
-        else:
-            # Safer on real hardware: reduce coupled kinematic stress by translating first, then rotating in place.
-            segments = [
-                ("translate", pos0, r0, g0, pos1, r0, g0),
-                ("rotate", pos1, r0, g0, pos1, r1, g1),
-            ]
-
-        seg_specs: list[tuple[str, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray, float, int]] = []
-        total_planned_steps = 0
-        for name, s_pos, s_rot, s_g, e_pos, e_rot, e_g in segments:
-            seg_pos_dist = float(np.linalg.norm(e_pos - s_pos))
-            seg_rot_dist = _rotation_geodesic_distance(s_rot, e_rot)
-            seg_g_dist = abs(float(e_g) - float(s_g))
-            seg_n_pos = int(math.ceil(seg_pos_dist / max(float(args.max_pos_step_m), 1e-6)))
-            seg_n_rot = int(math.ceil(seg_rot_dist / max(float(args.max_rot_step_rad), 1e-6)))
-            seg_n_gri = int(math.ceil(seg_g_dist / 0.02))
-            seg_steps = max(1, seg_n_pos, seg_n_rot, seg_n_gri)
-            seg_specs.append((name, s_pos, s_rot, float(s_g), e_pos, e_rot, float(e_g), seg_steps))
-            total_planned_steps += seg_steps
-
-        print(
-            f"[INFO] motion_mode={'simultaneous' if args.simultaneous_pose_rot else 'position-first'} "
-            f"segments={len(seg_specs)} planned_steps={total_planned_steps} max_steps={int(args.max_steps)}"
+        exceed_initial_gap = (
+            pos_dist > float(args.max_initial_pos_dist_m) or rot_dist > float(args.max_initial_rot_dist_rad)
         )
+        if exceed_initial_gap and (not bool(args.allow_large_move)):
+            if str(args.motion_space).lower() == "joint":
+                print(
+                    "[WARN] Initial Cartesian gap is large, but joint-space planner is enabled. "
+                    "Proceeding with strict joint safety checks."
+                )
+            else:
+                raise RuntimeError(
+                    "Initial gap is too large for automatic approach: "
+                    f"pos_dist={pos_dist:.3f}m (limit={args.max_initial_pos_dist_m}), "
+                    f"rot_dist={rot_dist:.3f}rad (limit={args.max_initial_rot_dist_rad}). "
+                    "Please jog robot closer manually or rerun with --allow-large-move after safety confirmation."
+                )
 
         ok_count = 0
         timeout_streak = 0
         global_step = 0
         max_steps = int(args.max_steps)
         truncated = False
+        total_planned_steps = 0
 
-        for seg_idx, (seg_name, s_pos, s_rot, s_g, e_pos, e_rot, e_g, seg_steps) in enumerate(seg_specs, start=1):
-            seg_pos_dist = float(np.linalg.norm(e_pos - s_pos))
-            seg_rot_dist = _rotation_geodesic_distance(s_rot, e_rot)
-            print(
-                f"[SEG {seg_idx}/{len(seg_specs)}] {seg_name} "
-                f"steps={seg_steps} pos_dist={seg_pos_dist:.6f} rot_dist={seg_rot_dist:.6f}"
+        if str(args.motion_space).lower() == "joint":
+            robot = getattr(adapter, "_robot", None)
+            rm_module = getattr(adapter, "_rm_module", None)
+            if robot is None or rm_module is None:
+                raise RuntimeError("Joint-space planner requires a connected RM robot and SDK module.")
+
+            ret_joint, raw_joint = robot.rm_get_joint_degree()
+            if int(ret_joint) != 0:
+                raise RuntimeError(f"rm_get_joint_degree failed with code {ret_joint}")
+            raw_joint = np.asarray(raw_joint, dtype=np.float64).reshape(-1)
+            if raw_joint.size <= 0:
+                raise RuntimeError("rm_get_joint_degree returned empty list")
+            dof = min(_safe_dof(robot, fallback=int(raw_joint.size)), int(raw_joint.size))
+            q0 = raw_joint[:dof].copy()
+
+            q_min, q_max = _read_joint_limits(robot, dof)
+            margin = float(max(args.joint_limit_margin_deg, 0.0))
+            q_min_soft = q_min + margin
+            q_max_soft = q_max - margin
+            if np.any(q_min_soft >= q_max_soft):
+                print("[WARN] joint_limit_margin_deg too large for hardware limits, fallback to hard limits.")
+                q_min_soft = q_min.copy()
+                q_max_soft = q_max.copy()
+
+            pos1_base, rot1_base = adapter._manual_to_base_pose(pos1, r1)
+            euler1_base = _matrix_to_euler_xyz(rot1_base)
+            target_pose_base = [
+                float(pos1_base[0]),
+                float(pos1_base[1]),
+                float(pos1_base[2]),
+                float(euler1_base[0]),
+                float(euler1_base[1]),
+                float(euler1_base[2]),
+            ]
+
+            q_in_7 = _to_len7_joint(q0, dof)
+            ik_params = rm_module.rm_inverse_kinematics_params_t(
+                q_in=q_in_7,
+                q_pose=target_pose_base,
+                flag=1,
             )
-            for i in range(1, seg_steps + 1):
-                if global_step >= max_steps:
-                    truncated = True
-                    print(f"[WARN] reached max_steps={max_steps}, stop interpolation early.")
-                    break
+            ik_ret, q_target_raw = robot.rm_algo_inverse_kinematics(ik_params)
+            if int(ik_ret) != 0:
+                raise RuntimeError(
+                    f"rm_algo_inverse_kinematics failed: ret={ik_ret}, "
+                    "target pose may be unreachable in current branch."
+                )
+            q_target_raw = np.asarray(q_target_raw, dtype=np.float64).reshape(-1)
+            if q_target_raw.size < dof:
+                raise RuntimeError(f"IK output length mismatch: {q_target_raw.size} < dof {dof}")
+            q1 = q_target_raw[:dof].copy()
 
-                alpha = float(i / seg_steps)
-                pos_i = (1.0 - alpha) * s_pos + alpha * e_pos
-                r_i = _slerp_matrix(s_rot, e_rot, alpha)
-                rot6d_i = matrix_to_rot6d(r_i)
-                g_i = float((1.0 - alpha) * s_g + alpha * e_g)
+            ok_target, target_issues = _check_joint_safety(
+                robot,
+                q1,
+                q_min_soft,
+                q_max_soft,
+                dof,
+                enable_self_collision_check=not bool(args.disable_self_collision_check),
+                enable_singularity_check=not bool(args.disable_singularity_check),
+                require_algo_checks=bool(args.require_algo_checks),
+            )
+            if not ok_target:
+                raise RuntimeError(f"Target joint pose failed safety checks: {target_issues}")
 
-                action = {
-                    "x": float(pos_i[0]),
-                    "y": float(pos_i[1]),
-                    "z": float(pos_i[2]),
-                    "rot6d_0": float(rot6d_i[0]),
-                    "rot6d_1": float(rot6d_i[1]),
-                    "rot6d_2": float(rot6d_i[2]),
-                    "rot6d_3": float(rot6d_i[3]),
-                    "rot6d_4": float(rot6d_i[4]),
-                    "rot6d_5": float(rot6d_i[5]),
-                    "gripper": float(g_i),
-                }
+            health = _joint_health_summary(robot, dof)
+            print(f"[INFO] motion_mode=joint-space dof={dof}")
+            print(f"[INFO] current joint(deg)={_format_joint(q0)}")
+            print(f"[INFO] target  joint(deg)={_format_joint(q1)}")
+            print(f"[INFO] joint hard min(deg)={_format_joint(q_min)}")
+            print(f"[INFO] joint hard max(deg)={_format_joint(q_max)}")
+            print(f"[INFO] joint soft min(deg)={_format_joint(q_min_soft)}")
+            print(f"[INFO] joint soft max(deg)={_format_joint(q_max_soft)}")
+            if health.get("available", False):
+                print(
+                    "[INFO] joint health: "
+                    f"ret={health.get('return_code')}, "
+                    f"err_flag={health.get('err_flag')}, "
+                    f"brake_state={health.get('brake_state')}"
+                )
+
+            max_joint_delta = float(np.max(np.abs(q1 - q0)))
+            n_steps = int(math.ceil(max_joint_delta / max(float(args.max_joint_step_deg), 1e-3)))
+            n_steps = max(1, n_steps)
+            total_planned_steps = int(n_steps)
+            if n_steps > max_steps:
+                truncated = True
+                print(f"[WARN] planned steps {n_steps} > max_steps {max_steps}, truncating.")
+                n_steps = max_steps
+
+            print(
+                f"[INFO] planned_joint_steps={total_planned_steps}, executed_limit={n_steps}, "
+                f"max_joint_delta_deg={max_joint_delta:.3f}"
+            )
+
+            speed = int(np.clip(int(args.joint_speed), 1, 100))
+            connect = 0
+            if getattr(adapter, "_trajectory_enum", None) is not None:
+                try:
+                    connect = int(adapter._trajectory_enum.RM_TRAJECTORY_DISCONNECT_E)
+                except Exception:
+                    connect = 0
+
+            for i in range(1, n_steps + 1):
+                alpha = float(i / n_steps)
+                q_i = (1.0 - alpha) * q0 + alpha * q1
+                ok_i, issues_i = _check_joint_safety(
+                    robot,
+                    q_i,
+                    q_min_soft,
+                    q_max_soft,
+                    dof,
+                    enable_self_collision_check=not bool(args.disable_self_collision_check),
+                    enable_singularity_check=not bool(args.disable_singularity_check),
+                    require_algo_checks=bool(args.require_algo_checks),
+                )
+                if not ok_i:
+                    raise RuntimeError(f"joint safety precheck failed at step {i}/{n_steps}: {issues_i}")
 
                 t0 = time.perf_counter()
-                adapter.send_action(action)
-                done = adapter.wait_until_action_complete(float(args.wait_timeout_s))
+                ret_cmd = robot.rm_movej(q_i.tolist(), speed, 0, connect, 0)
+                if int(ret_cmd) != 0:
+                    raise RuntimeError(f"rm_movej failed at step {i}/{n_steps} with code {ret_cmd}")
+
+                done, q_last, reason = _wait_joint_close(
+                    robot=robot,
+                    target_joint=q_i,
+                    timeout_s=float(args.wait_timeout_s),
+                    tol_deg=float(args.joint_tol_deg),
+                    poll_dt_s=float(args.joint_poll_dt_s),
+                )
                 dt = (time.perf_counter() - t0) * 1000.0
                 global_step += 1
                 if done:
@@ -322,8 +596,8 @@ def main() -> None:
                 else:
                     timeout_streak += 1
                     print(
-                        f"[WARN] wait timeout at global_step {global_step}/{max_steps}, "
-                        f"segment={seg_name} step={i}/{seg_steps}, streak={timeout_streak}, dt={dt:.1f}ms"
+                        f"[WARN] wait timeout at step {i}/{n_steps}, streak={timeout_streak}, "
+                        f"reason={reason}, dt={dt:.1f}ms"
                     )
                     if timeout_streak >= int(args.max_timeout_streak):
                         try:
@@ -331,18 +605,107 @@ def main() -> None:
                         except Exception:
                             pass
                         raise RuntimeError(
-                            "Aborting due to consecutive action timeouts. "
+                            "Aborting due to consecutive joint-step timeouts. "
                             "Robot may be in protective stop / unreachable state."
                         )
 
-                if global_step <= 3 or i == seg_steps or global_step % 10 == 0:
+                if i <= 3 or i == n_steps or i % 10 == 0:
                     print(
-                        f"[STEP {global_step:03d}/{max_steps}] done={int(done)} "
-                        f"seg={seg_name} xyz={_format_vec(pos_i)} dt={dt:.1f}ms"
+                        f"[STEP {i:03d}/{n_steps}] done={int(done)} "
+                        f"joint={_format_joint(q_i)} "
+                        f"joint_err={float(np.max(np.abs(q_last - q_i))):.3f}deg dt={dt:.1f}ms"
                     )
+        else:
+            if bool(args.simultaneous_pose_rot):
+                segments = [("pose+rot", pos0, r0, g0, pos1, r1, g1)]
+            else:
+                # Safer on real hardware: reduce coupled kinematic stress by translating first, then rotating in place.
+                segments = [
+                    ("translate", pos0, r0, g0, pos1, r0, g0),
+                    ("rotate", pos1, r0, g0, pos1, r1, g1),
+                ]
 
-            if truncated:
-                break
+            seg_specs: list[tuple[str, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray, float, int]] = []
+            for name, s_pos, s_rot, s_g, e_pos, e_rot, e_g in segments:
+                seg_pos_dist = float(np.linalg.norm(e_pos - s_pos))
+                seg_rot_dist = _rotation_geodesic_distance(s_rot, e_rot)
+                seg_g_dist = abs(float(e_g) - float(s_g))
+                seg_n_pos = int(math.ceil(seg_pos_dist / max(float(args.max_pos_step_m), 1e-6)))
+                seg_n_rot = int(math.ceil(seg_rot_dist / max(float(args.max_rot_step_rad), 1e-6)))
+                seg_n_gri = int(math.ceil(seg_g_dist / 0.02))
+                seg_steps = max(1, seg_n_pos, seg_n_rot, seg_n_gri)
+                seg_specs.append((name, s_pos, s_rot, float(s_g), e_pos, e_rot, float(e_g), seg_steps))
+                total_planned_steps += seg_steps
+
+            print(
+                f"[INFO] motion_mode={'simultaneous' if args.simultaneous_pose_rot else 'position-first'} "
+                f"segments={len(seg_specs)} planned_steps={total_planned_steps} max_steps={int(args.max_steps)}"
+            )
+
+            for seg_idx, (seg_name, s_pos, s_rot, s_g, e_pos, e_rot, e_g, seg_steps) in enumerate(seg_specs, start=1):
+                seg_pos_dist = float(np.linalg.norm(e_pos - s_pos))
+                seg_rot_dist = _rotation_geodesic_distance(s_rot, e_rot)
+                print(
+                    f"[SEG {seg_idx}/{len(seg_specs)}] {seg_name} "
+                    f"steps={seg_steps} pos_dist={seg_pos_dist:.6f} rot_dist={seg_rot_dist:.6f}"
+                )
+                for i in range(1, seg_steps + 1):
+                    if global_step >= max_steps:
+                        truncated = True
+                        print(f"[WARN] reached max_steps={max_steps}, stop interpolation early.")
+                        break
+
+                    alpha = float(i / seg_steps)
+                    pos_i = (1.0 - alpha) * s_pos + alpha * e_pos
+                    r_i = _slerp_matrix(s_rot, e_rot, alpha)
+                    rot6d_i = matrix_to_rot6d(r_i)
+                    g_i = float((1.0 - alpha) * s_g + alpha * e_g)
+
+                    action = {
+                        "x": float(pos_i[0]),
+                        "y": float(pos_i[1]),
+                        "z": float(pos_i[2]),
+                        "rot6d_0": float(rot6d_i[0]),
+                        "rot6d_1": float(rot6d_i[1]),
+                        "rot6d_2": float(rot6d_i[2]),
+                        "rot6d_3": float(rot6d_i[3]),
+                        "rot6d_4": float(rot6d_i[4]),
+                        "rot6d_5": float(rot6d_i[5]),
+                        "gripper": float(g_i),
+                    }
+
+                    t0 = time.perf_counter()
+                    adapter.send_action(action)
+                    done = adapter.wait_until_action_complete(float(args.wait_timeout_s))
+                    dt = (time.perf_counter() - t0) * 1000.0
+                    global_step += 1
+                    if done:
+                        ok_count += 1
+                        timeout_streak = 0
+                    else:
+                        timeout_streak += 1
+                        print(
+                            f"[WARN] wait timeout at global_step {global_step}/{max_steps}, "
+                            f"segment={seg_name} step={i}/{seg_steps}, streak={timeout_streak}, dt={dt:.1f}ms"
+                        )
+                        if timeout_streak >= int(args.max_timeout_streak):
+                            try:
+                                adapter.stop_motion()
+                            except Exception:
+                                pass
+                            raise RuntimeError(
+                                "Aborting due to consecutive action timeouts. "
+                                "Robot may be in protective stop / unreachable state."
+                            )
+
+                    if global_step <= 3 or i == seg_steps or global_step % 10 == 0:
+                        print(
+                            f"[STEP {global_step:03d}/{max_steps}] done={int(done)} "
+                            f"seg={seg_name} xyz={_format_vec(pos_i)} dt={dt:.1f}ms"
+                        )
+
+                if truncated:
+                    break
 
         final_obs = adapter.get_observation()
         final_state = np.asarray(final_obs["observation.state"], dtype=np.float64).reshape(-1)
@@ -364,6 +727,7 @@ def main() -> None:
 
         report.update(
             {
+                "motion_space": str(args.motion_space),
                 "current_state_before": current_state.tolist(),
                 "final_state": final_state.tolist(),
                 "pos_dist_before": pos_dist,
@@ -372,6 +736,8 @@ def main() -> None:
                 "executed_steps": int(global_step),
                 "truncated_by_max_steps": bool(truncated),
                 "wait_success_count": int(ok_count),
+                "joint_limit_margin_deg": float(args.joint_limit_margin_deg),
+                "joint_step_deg": float(args.max_joint_step_deg),
                 "final_pos_err_m": pos_err,
                 "final_rot_err_rad": rot_err,
                 "final_l2_err": l2_err,
