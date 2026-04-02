@@ -53,6 +53,13 @@ class RuntimeStats:
     key_event: str
     camera_source: str
     safety_flags: str
+    image_mean: float
+    image_std: float
+    image_delta_mae: float
+    image_min: int
+    image_max: int
+    raw_action_oob_count: int
+    raw_action_oob_ratio: float
 
 
 def _ensure_parent(path: str) -> None:
@@ -85,6 +92,50 @@ def _append_csv(path: str, row: list):
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(row)
+
+
+def _compute_image_stats(curr: np.ndarray, prev: np.ndarray | None) -> tuple[float, float, float, int, int]:
+    img = np.asarray(curr)
+    if img.size == 0:
+        return 0.0, 0.0, 0.0, 0, 0
+
+    img_f32 = img.astype(np.float32, copy=False)
+    mean = float(np.mean(img_f32))
+    std = float(np.std(img_f32))
+    vmin = int(np.min(img_f32))
+    vmax = int(np.max(img_f32))
+
+    if prev is None:
+        delta_mae = 0.0
+    else:
+        prev_f32 = np.asarray(prev).astype(np.float32, copy=False)
+        if prev_f32.shape != img_f32.shape:
+            delta_mae = float("nan")
+        else:
+            delta_mae = float(np.mean(np.abs(img_f32 - prev_f32)))
+
+    return mean, std, delta_mae, vmin, vmax
+
+
+def _compute_raw_action_oob(
+    raw_action: np.ndarray,
+    action_names: list[str],
+    action_bounds: dict[str, list[float]],
+) -> tuple[int, float, list[str]]:
+    oob_names: list[str] = []
+    for idx, name in enumerate(action_names):
+        bounds = action_bounds.get(name)
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+            continue
+        low = float(bounds[0])
+        high = float(bounds[1])
+        val = float(raw_action[idx])
+        if val < low or val > high:
+            oob_names.append(name)
+
+    dim = max(len(action_names), 1)
+    ratio = float(len(oob_names) / float(dim))
+    return len(oob_names), ratio, oob_names
 
 
 def main() -> None:
@@ -129,6 +180,13 @@ def main() -> None:
             "key_event",
             "camera_source",
             "safety_flags",
+            "image_mean",
+            "image_std",
+            "image_delta_mae",
+            "image_min",
+            "image_max",
+            "raw_action_oob_count",
+            "raw_action_oob_ratio",
         ],
     )
     _write_csv_header(action_csv, ["step", *action_names])
@@ -196,7 +254,9 @@ def main() -> None:
     )
 
     prev_action = None
+    prev_image = None
     step = 0
+    oob_streak = 0
 
     print(f"[INFO] target_hz={target_hz}, pretrained={pretrained_path}")
     print(f"[INFO] execution_mode={execution_mode}, action_wait_timeout_s={action_wait_timeout_s}")
@@ -253,6 +313,9 @@ def main() -> None:
             obs = adapter.get_observation()
             t_obs1 = time.perf_counter()
             obs_state = np.asarray(obs.get("observation.state"), dtype=np.float64).reshape(-1)
+            obs_image = np.asarray(obs.get("observation.image"))
+            image_mean, image_std, image_delta_mae, image_min, image_max = _compute_image_stats(obs_image, prev_image)
+            prev_image = obs_image.copy()
             if obs_state.shape[0] != len(action_names):
                 raise RuntimeError(
                     "Invalid observation.state shape from adapter: "
@@ -273,6 +336,15 @@ def main() -> None:
             raw_action_dict = make_robot_action(action_tensor, dataset.features)
             raw_action = np.array([raw_action_dict[n] for n in action_names], dtype=np.float64)
             t_inf1 = time.perf_counter()
+            raw_oob_count, raw_oob_ratio, raw_oob_names = _compute_raw_action_oob(
+                raw_action=raw_action,
+                action_names=action_names,
+                action_bounds=cfg["safety"]["action_bounds"],
+            )
+            if raw_oob_ratio >= 0.5:
+                oob_streak += 1
+            else:
+                oob_streak = 0
 
             if not np.all(np.isfinite(raw_action)):
                 print(f"[ERROR] Non-finite raw_action at step={step}: {raw_action.tolist()}")
@@ -317,6 +389,13 @@ def main() -> None:
                 key_event=ctrl.last_key,
                 camera_source=adapter.camera_source(),
                 safety_flags="|".join(flags),
+                image_mean=image_mean,
+                image_std=image_std,
+                image_delta_mae=image_delta_mae,
+                image_min=image_min,
+                image_max=image_max,
+                raw_action_oob_count=raw_oob_count,
+                raw_action_oob_ratio=raw_oob_ratio,
             )
 
             _append_csv(
@@ -338,6 +417,13 @@ def main() -> None:
                     stat.key_event,
                     stat.camera_source,
                     stat.safety_flags,
+                    f"{stat.image_mean:.4f}",
+                    f"{stat.image_std:.4f}",
+                    f"{stat.image_delta_mae:.4f}",
+                    stat.image_min,
+                    stat.image_max,
+                    stat.raw_action_oob_count,
+                    f"{stat.raw_action_oob_ratio:.4f}",
                 ],
             )
             _append_csv(action_csv, [step, *[f"{x:.8f}" for x in safe_action.tolist()]])
@@ -350,12 +436,35 @@ def main() -> None:
                 safe_action_str = ", ".join(f"{name}={safe_action[i]:.6f}" for i, name in enumerate(action_names))
                 print(f"[DEBUG step={step}] raw_action: {raw_action_str}")
                 print(f"[DEBUG step={step}] safe_action: {safe_action_str}")
+                print(
+                    f"[DEBUG step={step}] image_stats: mean={image_mean:.3f}, std={image_std:.3f}, "
+                    f"delta_mae={image_delta_mae:.3f}, min={image_min}, max={image_max}"
+                )
+                print(
+                    f"[DEBUG step={step}] raw_action_oob: {raw_oob_count}/{len(action_names)} "
+                    f"({raw_oob_ratio:.0%}) dims={raw_oob_names}"
+                )
+
+            if image_std < 2.0:
+                print(
+                    f"[WARN] step={step} image_std={image_std:.3f} is very low. "
+                    "Camera may be dark/frozen or transform params are wrong."
+                )
+
+            if oob_streak == 3:
+                print(
+                    "[WARN] Raw action has been out-of-bounds for >=3 consecutive steps on most dims. "
+                    "This usually indicates checkpoint/data semantic mismatch "
+                    "(e.g. action coordinate frame or normalization mismatch)."
+                )
 
             if step % 10 == 0:
                 print(
                     f"[STEP {step}] hz={stat.loop_hz:.2f}, wait={stat.wait_ms:.1f}ms, "
                     f"infer={stat.infer_ms:.2f}ms, complete={stat.action_complete}, "
                     f"overrun={stat.overrun}, cam={stat.camera_source}, "
+                    f"img_std={stat.image_std:.2f}, img_delta={stat.image_delta_mae:.2f}, "
+                    f"raw_oob={stat.raw_action_oob_count}/{len(action_names)}, "
                     f"flags={stat.safety_flags or 'none'}"
                 )
 
