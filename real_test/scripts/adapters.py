@@ -404,8 +404,12 @@ class GermanArmAdapter(BaseRobotAdapter):
             raise ValueError("workspace_bounds_base must be a dict when workspace_clip_in_adapter=true")
 
     def _connect_camera(self) -> None:
+        camera_stream_url = self.robot_cfg.get("camera_stream_url")
         camera_device_path = self.robot_cfg.get("camera_device_path")
         camera_index = self.robot_cfg.get("camera_index")
+        if camera_stream_url:
+            # Allow opening network streams (e.g. GoPro RTMP/UDP/Webcam URL) without a capture card.
+            camera_device_path = str(camera_stream_url)
         if camera_device_path is None and camera_index is None:
             self._camera_source = "placeholder"
             return

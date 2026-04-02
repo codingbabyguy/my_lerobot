@@ -93,7 +93,10 @@ def main() -> None:
     cv2.setNumThreads(1)
 
     camera_api = _get_cv2_api_id(cv2, robot_cfg.get("camera_api", "auto"))
+    camera_stream_url = robot_cfg.get("camera_stream_url")
     camera_device_path = robot_cfg.get("camera_device_path")
+    if camera_stream_url:
+        camera_device_path = str(camera_stream_url)
     camera_index = robot_cfg.get("camera_index")
     cap, source_desc = _open_camera(
         cv2_module=cv2,

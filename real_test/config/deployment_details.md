@@ -62,6 +62,7 @@ config.expected_work_frame_names	允许的 work frame 名称列表	先用 check_
 config.expected_tool_frame_names	允许的 tool frame 名称列表	先用 check_rm_frames.py 实测后填写
 config.workspace_clip_in_adapter	是否在适配器做 base-frame workspace 裁剪	建议 false（由 safety 在策略坐标系裁剪）
 config.camera_api	相机接口后端	按当前 OpenCV 构建选择；你这台机器更建议 auto
+config.camera_stream_url	网络视频流地址（可选）	无采集卡时可填 GoPro/OBS 输出 URL，优先级高于 camera_device_path
 config.camera_device_path	稳定视频设备路径	优先用 /dev/v4l/by-id/...video-index0
 config.camera_index	本机相机索引	普通 USB 摄像头可用；有 device_path 时可忽略
 config.camera_resolution	采集分辨率	建议和 GoPro/采集卡输出一致
