@@ -147,6 +147,77 @@ def _compute_raw_action_oob(
     return len(oob_names), ratio, oob_names
 
 
+def _is_valid_axis_bounds(bounds: object) -> bool:
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+        return False
+    low = float(bounds[0])
+    high = float(bounds[1])
+    return np.isfinite(low) and np.isfinite(high) and (low < high)
+
+
+def _validate_coordinate_contract(cfg: dict) -> dict[str, bool]:
+    action_schema = cfg.get("action_schema", {})
+    adapter_cfg = cfg.get("robot_adapter", {}).get("config", {})
+    safety_cfg = cfg.get("safety", {})
+    startup_cfg = cfg.get("startup_pose", {})
+
+    action_frame = str(action_schema.get("coordinate_frame", "")).strip().lower()
+    policy_frame = str(adapter_cfg.get("policy_frame", "")).strip().lower()
+    if action_frame != "manual_relative_frame":
+        raise ValueError(
+            "action_schema.coordinate_frame must be manual_relative_frame. "
+            f"Got {action_schema.get('coordinate_frame')!r}"
+        )
+    if policy_frame != "manual_relative_frame":
+        raise ValueError(
+            "robot_adapter.config.policy_frame must be manual_relative_frame. "
+            f"Got {adapter_cfg.get('policy_frame')!r}"
+        )
+
+    map_startup_to_policy_origin = bool(startup_cfg.get("map_startup_to_policy_origin", False))
+    allow_startup_policy_anchor = bool(startup_cfg.get("allow_startup_policy_anchor", False))
+    if map_startup_to_policy_origin and not allow_startup_policy_anchor:
+        raise ValueError(
+            "startup_pose.map_startup_to_policy_origin=true introduces startup-relative semantics. "
+            "For manual absolute contract, set it to false. If you really need it, also set "
+            "startup_pose.allow_startup_policy_anchor=true explicitly."
+        )
+
+    workspace_clip_in_adapter = bool(adapter_cfg.get("workspace_clip_in_adapter", False))
+    enable_policy_workspace_clip = bool(safety_cfg.get("enable_policy_workspace_clip", True))
+    if not workspace_clip_in_adapter and not enable_policy_workspace_clip:
+        raise ValueError(
+            "Workspace clip is disabled in both safety and adapter path. "
+            "At least one workspace clip layer must be enabled."
+        )
+
+    workspace_bounds = safety_cfg.get("workspace_bounds", {})
+    if enable_policy_workspace_clip:
+        for axis in ("x", "y", "z"):
+            if not _is_valid_axis_bounds(workspace_bounds.get(axis)):
+                raise ValueError(f"safety.workspace_bounds.{axis} must be a valid [low, high] range")
+
+    if workspace_clip_in_adapter:
+        bounds_base = adapter_cfg.get("workspace_bounds_base", adapter_cfg.get("workspace_bounds_world"))
+        if not isinstance(bounds_base, dict):
+            raise ValueError(
+                "robot_adapter.config.workspace_clip_in_adapter=true requires "
+                "workspace_bounds_base or workspace_bounds_world"
+            )
+        for axis in ("x", "y", "z"):
+            if not _is_valid_axis_bounds(bounds_base.get(axis)):
+                raise ValueError(
+                    "robot_adapter workspace base bounds are invalid: "
+                    f"workspace_bounds_base.{axis} must be [low, high]"
+                )
+
+    return {
+        "map_startup_to_policy_origin": map_startup_to_policy_origin,
+        "workspace_clip_in_adapter": workspace_clip_in_adapter,
+        "enable_policy_workspace_clip": enable_policy_workspace_clip,
+    }
+
+
 def _extract_anchor_from_state(state10: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     arr = np.asarray(state10, dtype=np.float64).reshape(-1)
     if arr.shape[0] != 10:
@@ -394,10 +465,11 @@ def main() -> None:
 
     cfg = _load_json(args.config)
     action_names = cfg["action_schema"]["names"]
+    contract = _validate_coordinate_contract(cfg)
     startup_cfg = cfg.get("startup_pose", {})
     if not isinstance(startup_cfg, dict):
         startup_cfg = {}
-    map_startup_to_policy_origin = bool(startup_cfg.get("map_startup_to_policy_origin", True))
+    map_startup_to_policy_origin = bool(contract["map_startup_to_policy_origin"])
 
     target_hz = float(cfg["control"]["target_hz"])
     target_dt = 1.0 / target_hz
@@ -448,15 +520,10 @@ def main() -> None:
         max_rot_delta_rad=float(cfg["safety"]["max_rot_delta_rad"]),
         max_gripper_delta_per_step=float(cfg["safety"]["max_gripper_delta_per_step"]),
         clip_workspace_in_action_space=(
-            not bool(cfg["robot_adapter"]["config"].get("workspace_clip_in_adapter", False))
-            and (not map_startup_to_policy_origin)
+            bool(contract["enable_policy_workspace_clip"])
+            and (not bool(contract["workspace_clip_in_adapter"]))
         ),
     )
-    if map_startup_to_policy_origin:
-        print(
-            "[INFO] startup anchor mapping is enabled: disable policy-space workspace clip "
-            "to avoid clipping against absolute workspace bounds."
-        )
     safety_filter = ActionSafetyFilter(safety_cfg, action_names)
     estop = EStop(cfg["estop"]["enabled"], cfg["estop"]["trigger_file"])
     keyboard = KeyboardController(enabled=bool(cfg["control"].get("keyboard_enabled", True)))
@@ -492,14 +559,6 @@ def main() -> None:
     postprocessor.reset()
 
     robot_adapter_cfg = dict(cfg["robot_adapter"]["config"])
-    if robot_adapter_cfg.get("workspace_clip_in_adapter", False):
-        has_base_bounds = "workspace_bounds_base" in robot_adapter_cfg or "workspace_bounds_world" in robot_adapter_cfg
-        if not has_base_bounds:
-            print(
-                "[WARN] workspace_clip_in_adapter=true but workspace_bounds_base/workspace_bounds_world is missing. "
-                "Disable adapter-side clip and keep safety clip in policy frame."
-            )
-            robot_adapter_cfg["workspace_clip_in_adapter"] = False
 
     adapter = make_robot_adapter(
         cfg["robot_adapter"]["name"],
@@ -517,6 +576,12 @@ def main() -> None:
 
     print(f"[INFO] target_hz={target_hz}, pretrained={pretrained_path}")
     print(f"[INFO] execution_mode={execution_mode}, action_wait_timeout_s={action_wait_timeout_s}")
+    print(
+        "[INFO] coordinate_contract=manual_relative_frame, "
+        f"startup_anchor={int(map_startup_to_policy_origin)}, "
+        f"workspace_clip(policy={int(contract['enable_policy_workspace_clip'])}, "
+        f"adapter={int(contract['workspace_clip_in_adapter'])})"
+    )
     print(f"[INFO] estop trigger file: {cfg['estop']['trigger_file']}")
     print("[INFO] keyboard: p=pause c=continue e=estop q=quit")
 
@@ -524,7 +589,7 @@ def main() -> None:
     keyboard.start()
     pause_applied = False
     try:
-        use_startup_anchor = bool(startup_cfg.get("map_startup_to_policy_origin", True))
+        use_startup_anchor = bool(startup_cfg.get("map_startup_to_policy_origin", False))
         startup_enabled = bool(startup_cfg.get("enabled", True))
         if startup_enabled:
             startup_obs = adapter.get_observation()

@@ -36,20 +36,43 @@ def merge_config(base_cfg: dict, template_cfg: dict) -> dict:
         out["safety"]["action_bounds"] = tpl_safety["action_bounds"]
     if "workspace_bounds" in tpl_safety:
         out["safety"]["workspace_bounds"] = tpl_safety["workspace_bounds"]
+    out["safety"].setdefault("enable_policy_workspace_clip", True)
 
     out.setdefault("robot_adapter", {})
     out["robot_adapter"].setdefault("config", {})
     ra_cfg = out["robot_adapter"]["config"]
     tpl_ra_cfg = template_cfg.get("robot_adapter", {}).get("config", {})
 
-    for key in ("policy_frame", "manual_origin", "manual_rotation", "image_shape", "use_sdk_pose_transform"):
+    for key in (
+        "policy_frame",
+        "manual_origin",
+        "manual_rotation",
+        "image_shape",
+        "use_sdk_pose_transform",
+        "workspace_bounds_base",
+        "workspace_bounds_world",
+    ):
         if key in tpl_ra_cfg:
             ra_cfg[key] = tpl_ra_cfg[key]
 
     ra_cfg["workspace_clip_in_adapter"] = bool(ra_cfg.get("workspace_clip_in_adapter", False))
     ra_cfg.setdefault("lock_work_tool_frame", True)
+    ra_cfg.setdefault("frame_lock_require_expected_names", True)
     ra_cfg.setdefault("expected_work_frame_names", [])
     ra_cfg.setdefault("expected_tool_frame_names", [])
+    ra_cfg.setdefault(
+        "runtime_joint_guard",
+        {
+            "enabled": True,
+            "warn_only": False,
+            "joint_limit_margin_deg": 8.0,
+            "max_joint_step_deg": 6.0,
+            "enable_self_collision_check": False,
+            "enable_singularity_check": True,
+            "require_algo_checks": False,
+            "fail_on_ik_error": True,
+        },
+    )
     ra_cfg.pop("xyz_mean", None)
     ra_cfg.pop("xyz_std", None)
 
@@ -61,7 +84,8 @@ def merge_config(base_cfg: dict, template_cfg: dict) -> dict:
     startup.setdefault("enabled", True)
     startup.setdefault("mode", "safe_positive")
     startup.setdefault("xyz", [0.07, 0.0, 0.07])
-    startup.setdefault("map_startup_to_policy_origin", True)
+    startup.setdefault("map_startup_to_policy_origin", False)
+    startup.setdefault("allow_startup_policy_anchor", False)
     startup.setdefault("keep_current_rotation", True)
     startup.setdefault("joint_speed", 6)
     startup.setdefault("max_joint_step_deg", 0.8)

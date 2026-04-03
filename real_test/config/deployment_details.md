@@ -31,6 +31,7 @@ action_schema.rotation_representation	旋转表示	rot6d
 action_schema.gripper_unit	夹爪单位	normalized
 safety（安全限制）
 配置项	含义	建议
+safety.enable_policy_workspace_clip	是否在策略坐标系做 workspace 裁剪	建议 true（至少保留一层 workspace clip）
 safety.action_bounds.*	各维硬限幅	可保留数据集统计范围
 safety.workspace_bounds	工作空间硬边界	真机务必按工位收紧
 safety.max_xyz_speed_mps	末端速度上限	先小后大（你现在偏保守，合理）
@@ -58,9 +59,11 @@ config.completion_rot_tol_rad	到位姿态容差	实机可适当放宽
 config.manual_origin	采集标定参考系原点	来自 calibration_params.npz
 config.manual_rotation	采集标定参考系旋转矩阵	来自 calibration_params.npz
 config.lock_work_tool_frame	连接时检查 RM work/tool frame	true
+config.frame_lock_require_expected_names	frame lock 是否强制要求 expected 名称	建议 true（为空即阻断启动）
 config.expected_work_frame_names	允许的 work frame 名称列表	先用 check_rm_frames.py 实测后填写
 config.expected_tool_frame_names	允许的 tool frame 名称列表	先用 check_rm_frames.py 实测后填写
 config.workspace_clip_in_adapter	是否在适配器做 base-frame workspace 裁剪	建议 false（由 safety 在策略坐标系裁剪）
+config.runtime_joint_guard.*	每步下发前 IK/关节软限位预检	建议启用且 warn_only=false
 config.camera_api	相机接口后端	按当前 OpenCV 构建选择；你这台机器更建议 auto
 config.camera_stream_url	网络视频流地址（可选）	无采集卡时可填 GoPro/OBS 输出 URL，优先级高于 camera_device_path
 config.camera_device_path	稳定视频设备路径	优先用 /dev/v4l/by-id/...video-index0

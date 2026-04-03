@@ -36,6 +36,7 @@ def main() -> None:
     cfg = _load_json(args.config)
     robot_cfg = cfg["robot_adapter"]["config"]
     lock_frame = bool(robot_cfg.get("lock_work_tool_frame", True))
+    strict_expected_names = bool(robot_cfg.get("frame_lock_require_expected_names", True))
     expected_work = [_normalize(x) for x in robot_cfg.get("expected_work_frame_names", []) if str(x).strip()]
     expected_tool = [_normalize(x) for x in robot_cfg.get("expected_tool_frame_names", []) if str(x).strip()]
 
@@ -98,23 +99,30 @@ def main() -> None:
         print()
         print("frame_lock_config:")
         print(f"  lock_work_tool_frame: {lock_frame}")
+        print(f"  frame_lock_require_expected_names: {strict_expected_names}")
         print(f"  expected_work_frame_names: {expected_work}")
         print(f"  expected_tool_frame_names: {expected_tool}")
         print(f"  current_work_frame_name: {current_work_name}")
         print(f"  current_tool_frame_name: {current_tool_name}")
         print(f"  work_match: {work_match}")
         print(f"  tool_match: {tool_match}")
+        if lock_frame and strict_expected_names and (not expected_work or not expected_tool):
+            print("  status: INVALID (expected frame name list is empty)")
         print()
         print("checklist:")
         print("1. Training and inference should use the same manual_relative_frame.")
         print("2. If current work/tool frame differs from config expected names, pose semantics can drift.")
         print("3. Verify joint_degree is not near joint_min/joint_max before automatic move-to-start.")
         print("4. Move arm by a small +X action in policy frame and verify physical direction against calibration.")
+        if lock_frame and strict_expected_names and (not expected_work or not expected_tool):
+            print("5. Fill expected_work_frame_names and expected_tool_frame_names before running inference.")
         if args.strict and (not work_match or not tool_match):
             raise RuntimeError(
                 "Frame check failed in strict mode: "
                 f"work_match={work_match}, tool_match={tool_match}"
             )
+        if args.strict and lock_frame and strict_expected_names and (not expected_work or not expected_tool):
+            raise RuntimeError("Frame check failed in strict mode: expected frame names are empty in config")
     finally:
         robot.rm_delete_robot_arm()
 

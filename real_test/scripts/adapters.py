@@ -135,6 +135,98 @@ def _rotation_geodesic_distance(r_a: np.ndarray, r_b: np.ndarray) -> float:
     return float(np.arccos(cos_theta))
 
 
+def _safe_dof(robot: object, fallback: int = 7) -> int:
+    dof = int(getattr(robot, "arm_dof", 0) or 0)
+    return dof if dof > 0 else int(fallback)
+
+
+def _read_joint_degree(robot: object, dof: int) -> np.ndarray:
+    ret, joint = robot.rm_get_joint_degree()
+    if int(ret) != 0:
+        raise RuntimeError(f"rm_get_joint_degree failed with code {ret}")
+    arr = np.asarray(joint, dtype=np.float64).reshape(-1)
+    if arr.shape[0] < dof:
+        raise RuntimeError(f"rm_get_joint_degree returned insufficient length: {arr.shape[0]} < dof {dof}")
+    return arr[:dof].copy()
+
+
+def _read_joint_limits(robot: object, dof: int) -> tuple[np.ndarray, np.ndarray]:
+    ret_min, jmin = robot.rm_get_joint_min_pos()
+    ret_max, jmax = robot.rm_get_joint_max_pos()
+    if int(ret_min) != 0 or int(ret_max) != 0:
+        raise RuntimeError(f"failed to read joint limits: min_ret={ret_min}, max_ret={ret_max}")
+    min_arr = np.asarray(jmin, dtype=np.float64).reshape(-1)
+    max_arr = np.asarray(jmax, dtype=np.float64).reshape(-1)
+    if min_arr.shape[0] < dof or max_arr.shape[0] < dof:
+        raise RuntimeError(
+            f"joint limit length mismatch: min={min_arr.shape[0]}, max={max_arr.shape[0]}, dof={dof}"
+        )
+    return min_arr[:dof].copy(), max_arr[:dof].copy()
+
+
+def _to_len7_joint(q_deg: np.ndarray, dof: int) -> list[float]:
+    out = np.zeros(7, dtype=np.float64)
+    n = min(int(dof), 7, int(q_deg.shape[0]))
+    out[:n] = q_deg[:n]
+    return out.tolist()
+
+
+def _check_joint_safety(
+    robot: object,
+    q_deg: np.ndarray,
+    q_min_soft: np.ndarray,
+    q_max_soft: np.ndarray,
+    dof: int,
+    *,
+    enable_self_collision_check: bool,
+    enable_singularity_check: bool,
+    require_algo_checks: bool,
+) -> tuple[bool, list[str]]:
+    issues: list[str] = []
+    margin_low = q_deg - q_min_soft
+    margin_high = q_max_soft - q_deg
+    if np.any(margin_low < 0.0) or np.any(margin_high < 0.0):
+        bad = np.where((margin_low < 0.0) | (margin_high < 0.0))[0]
+        for idx in bad.tolist():
+            issues.append(
+                f"joint_limit_soft_violation:j{idx+1}:q={q_deg[idx]:.3f},"
+                f"min_soft={q_min_soft[idx]:.3f},max_soft={q_max_soft[idx]:.3f}"
+            )
+
+    if enable_self_collision_check and hasattr(robot, "rm_algo_safety_robot_self_collision_detection"):
+        try:
+            col = int(robot.rm_algo_safety_robot_self_collision_detection(_to_len7_joint(q_deg, dof)))
+            if col == 1:
+                issues.append("self_collision_detected")
+            elif col not in (0, 1):
+                msg = f"self_collision_check_unexpected_return={col}"
+                if require_algo_checks:
+                    issues.append(msg)
+                else:
+                    print(f"[WARN] {msg}")
+        except Exception as exc:
+            msg = f"self_collision_check_failed={exc}"
+            if require_algo_checks:
+                issues.append(msg)
+            else:
+                print(f"[WARN] {msg}")
+
+    if enable_singularity_check and dof == 6 and hasattr(robot, "rm_algo_kin_robot_singularity_analyse"):
+        try:
+            sing_ret, sing_dist = robot.rm_algo_kin_robot_singularity_analyse(q_deg[:6].tolist())
+            sing_ret = int(sing_ret)
+            if sing_ret != 0:
+                issues.append(f"singularity_detected:code={sing_ret},dist={float(sing_dist):.6f}")
+        except Exception as exc:
+            msg = f"singularity_check_failed={exc}"
+            if require_algo_checks:
+                issues.append(msg)
+            else:
+                print(f"[WARN] {msg}")
+
+    return len(issues) == 0, issues
+
+
 def _as_float_vector(value: Any, length: int, default: list[float] | None = None) -> np.ndarray:
     if value is None:
         if default is None:
@@ -351,6 +443,7 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._robot: Any = None
         self._thread_mode_ctor: Any = None
         self._trajectory_enum: Any = None
+        self._rm_module: Any = None
         self._rm_module_loaded = False
         self._image_shape = tuple(robot_cfg.get("image_shape", [224, 224, 3]))
         self._disable_gripper_control = bool(robot_cfg.get("disable_gripper_control", True))
@@ -381,6 +474,7 @@ class GermanArmAdapter(BaseRobotAdapter):
         )
         self._use_sdk_pose_transform = bool(robot_cfg.get("use_sdk_pose_transform", True))
         self._lock_work_tool_frame = bool(robot_cfg.get("lock_work_tool_frame", True))
+        self._frame_lock_require_expected_names = bool(robot_cfg.get("frame_lock_require_expected_names", True))
         self._expected_work_frame_names = [
             self._normalize_frame_name(x)
             for x in robot_cfg.get("expected_work_frame_names", [])
@@ -394,6 +488,19 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._connected_work_frame_name: str | None = None
         self._connected_tool_frame_name: str | None = None
         self._last_target_pose_base: np.ndarray | None = None
+        runtime_joint_guard = robot_cfg.get("runtime_joint_guard", {})
+        if not isinstance(runtime_joint_guard, dict):
+            runtime_joint_guard = {}
+        self._runtime_joint_guard_enabled = bool(runtime_joint_guard.get("enabled", True))
+        self._runtime_joint_guard_warn_only = bool(runtime_joint_guard.get("warn_only", False))
+        self._runtime_joint_limit_margin_deg = float(runtime_joint_guard.get("joint_limit_margin_deg", 8.0))
+        self._runtime_joint_max_step_deg = float(runtime_joint_guard.get("max_joint_step_deg", 6.0))
+        self._runtime_enable_self_collision_check = bool(
+            runtime_joint_guard.get("enable_self_collision_check", False)
+        )
+        self._runtime_enable_singularity_check = bool(runtime_joint_guard.get("enable_singularity_check", True))
+        self._runtime_require_algo_checks = bool(runtime_joint_guard.get("require_algo_checks", False))
+        self._runtime_guard_fail_on_ik_error = bool(runtime_joint_guard.get("fail_on_ik_error", True))
 
         ortho_check = self._manual_rotation_base.T @ self._manual_rotation_base
         if not np.allclose(ortho_check, np.eye(3), atol=1e-5):
@@ -402,6 +509,10 @@ class GermanArmAdapter(BaseRobotAdapter):
             raise ValueError("manual_rotation must be a right-handed rotation matrix")
         if self._workspace_clip_in_adapter and not isinstance(self._workspace_bounds_base, dict):
             raise ValueError("workspace_bounds_base must be a dict when workspace_clip_in_adapter=true")
+        if self._runtime_joint_limit_margin_deg < 0.0:
+            raise ValueError("runtime_joint_guard.joint_limit_margin_deg must be >= 0")
+        if self._runtime_joint_max_step_deg <= 0.0:
+            raise ValueError("runtime_joint_guard.max_joint_step_deg must be > 0")
 
     def _connect_camera(self) -> None:
         camera_stream_url = self.robot_cfg.get("camera_stream_url")
@@ -536,6 +647,22 @@ class GermanArmAdapter(BaseRobotAdapter):
         if not self._lock_work_tool_frame:
             return
 
+        if self._frame_lock_require_expected_names:
+            if not self._expected_work_frame_names:
+                raise RuntimeError(
+                    "lock_work_tool_frame=true but expected_work_frame_names is empty. "
+                    "Set robot_adapter.config.expected_work_frame_names before inference."
+                )
+            if not self._expected_tool_frame_names:
+                raise RuntimeError(
+                    "lock_work_tool_frame=true but expected_tool_frame_names is empty. "
+                    "Set robot_adapter.config.expected_tool_frame_names before inference."
+                )
+            if self._connected_work_frame_name is None:
+                raise RuntimeError("Failed to read current RM work frame name while frame lock is enabled.")
+            if self._connected_tool_frame_name is None:
+                raise RuntimeError("Failed to read current RM tool frame name while frame lock is enabled.")
+
         if self._expected_work_frame_names and self._connected_work_frame_name is not None:
             if self._connected_work_frame_name not in self._expected_work_frame_names:
                 raise RuntimeError(
@@ -590,6 +717,76 @@ class GermanArmAdapter(BaseRobotAdapter):
             pos[idx] = float(np.clip(pos[idx], float(axis_bounds[0]), float(axis_bounds[1])))
         return pos
 
+    def _runtime_precheck_target_pose(self, pose_base_xyzrpy: list[float]) -> None:
+        if (not self._runtime_joint_guard_enabled) or self._robot is None:
+            return
+        if self._rm_module is None:
+            if self._runtime_joint_guard_warn_only:
+                print("[WARN] runtime joint guard skipped: RM module unavailable")
+                return
+            raise RuntimeError("runtime joint guard requires RM SDK module")
+
+        issues: list[str] = []
+        try:
+            raw_joint = np.asarray(self._robot.rm_get_joint_degree()[1], dtype=np.float64).reshape(-1)
+            if raw_joint.size <= 0:
+                raise RuntimeError("rm_get_joint_degree returned empty list")
+            dof = min(_safe_dof(self._robot, fallback=int(raw_joint.size)), int(raw_joint.size))
+            q_seed = _read_joint_degree(self._robot, dof)
+            q_min, q_max = _read_joint_limits(self._robot, dof)
+
+            margin = float(max(self._runtime_joint_limit_margin_deg, 0.0))
+            q_min_soft = q_min + margin
+            q_max_soft = q_max - margin
+            if np.any(q_min_soft >= q_max_soft):
+                q_min_soft = q_min.copy()
+                q_max_soft = q_max.copy()
+
+            ik_params = self._rm_module.rm_inverse_kinematics_params_t(
+                q_in=_to_len7_joint(q_seed, dof),
+                q_pose=[float(x) for x in pose_base_xyzrpy],
+                flag=1,
+            )
+            ik_ret, q_target_raw = self._robot.rm_algo_inverse_kinematics(ik_params)
+            if int(ik_ret) != 0:
+                msg = f"runtime_ik_failed:code={ik_ret}"
+                if self._runtime_guard_fail_on_ik_error:
+                    issues.append(msg)
+                else:
+                    print(f"[WARN] {msg}")
+            else:
+                q_target_raw = np.asarray(q_target_raw, dtype=np.float64).reshape(-1)
+                if q_target_raw.size < dof:
+                    issues.append(f"runtime_ik_output_short:len={q_target_raw.size},dof={dof}")
+                else:
+                    q_target = q_target_raw[:dof].copy()
+                    ok, safety_issues = _check_joint_safety(
+                        self._robot,
+                        q_target,
+                        q_min_soft,
+                        q_max_soft,
+                        dof,
+                        enable_self_collision_check=self._runtime_enable_self_collision_check,
+                        enable_singularity_check=self._runtime_enable_singularity_check,
+                        require_algo_checks=self._runtime_require_algo_checks,
+                    )
+                    if not ok:
+                        issues.extend(safety_issues)
+                    max_step = float(np.max(np.abs(q_target - q_seed)))
+                    if max_step > float(self._runtime_joint_max_step_deg):
+                        issues.append(
+                            f"joint_step_too_large:max={max_step:.3f}deg,limit={self._runtime_joint_max_step_deg:.3f}deg"
+                        )
+        except Exception as exc:
+            issues.append(f"runtime_joint_guard_exception={exc}")
+
+        if issues:
+            msg = "runtime joint guard blocked action: " + "; ".join(issues)
+            if self._runtime_joint_guard_warn_only:
+                print(f"[WARN] {msg}")
+                return
+            raise RuntimeError(msg)
+
     def connect(self) -> None:
         self._load_rm_sdk()
 
@@ -626,6 +823,13 @@ class GermanArmAdapter(BaseRobotAdapter):
                     "[INFO] RM frame lock: "
                     f"work={self._connected_work_frame_name or 'unknown'}, "
                     f"tool={self._connected_tool_frame_name or 'unknown'}"
+                )
+            if self._runtime_joint_guard_enabled:
+                print(
+                    "[INFO] runtime_joint_guard: "
+                    f"warn_only={int(self._runtime_joint_guard_warn_only)}, "
+                    f"margin_deg={self._runtime_joint_limit_margin_deg:.2f}, "
+                    f"max_joint_step_deg={self._runtime_joint_max_step_deg:.2f}"
                 )
             if self._use_sdk_pose_transform and not self._lock_work_tool_frame:
                 print(
@@ -710,6 +914,9 @@ class GermanArmAdapter(BaseRobotAdapter):
         if not self.connected or self._robot is None:
             raise RuntimeError("GermanArmAdapter is not connected")
 
+        self._refresh_connected_frames()
+        self._validate_frame_lock()
+
         try:
             rot6d = np.array([float(action[f"rot6d_{i}"]) for i in range(6)], dtype=np.float64)
             pos_manual = np.array([float(action["x"]), float(action["y"]), float(action["z"])], dtype=np.float64)
@@ -729,6 +936,7 @@ class GermanArmAdapter(BaseRobotAdapter):
             float(euler[1]),
             float(euler[2]),
         ]
+        self._runtime_precheck_target_pose(pose)
         self._last_target_pose = np.array(pose, dtype=np.float64)
         self._last_target_pose_base = self._last_target_pose.copy()
 
