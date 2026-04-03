@@ -155,3 +155,30 @@ python real_test/scripts/pseudo_inference_compare.py \
   --config /Users/wangyi/Vscode/vscode_python_work/tactile_work/my_lerobot/real_test/config/deployment_config.generated.json
 ```
 
+### 4.1 PyBullet 起点体检（新增）
+
+先安装依赖：
+
+```bash
+cd /Users/wangyi/Vscode/vscode_python_work/tactile_work/my_lerobot
+python -m pip install pybullet matplotlib
+```
+
+运行示例：
+
+```bash
+cd /Users/wangyi/Vscode/vscode_python_work/tactile_work/my_lerobot
+python real_test/scripts/pybullet_episode_start_check.py \
+  --config /Users/wangyi/Vscode/vscode_python_work/tactile_work/my_lerobot/real_test/config/deployment_config.generated.json \
+  --urdf-path /path/to/rm_65_description/urdf/rm_65_description.urdf \
+  --urdf-package-roots rm_65_description=/path/to/rm_65_description \
+  --ee-link-name Link6 \
+  --episodes 0,1,2,3,4 \
+  --steps 0,1,2,3 \
+  --output-dir /Users/wangyi/Vscode/vscode_python_work/tactile_work/my_lerobot/real_test/results/start_pose_check
+```
+
+核心产物：
+
+- `start_pose_check.csv`：每个候选起点的 IK 误差/关节裕量
+- `start_pose_check_summary.json`：`usable_ratio`、`ik_ok_ratio`、`soft_margin_ok_ratio`

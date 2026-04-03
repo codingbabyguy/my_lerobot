@@ -30,6 +30,7 @@
 - `scripts/keyboard_control.py`：终端键盘控制（暂停/继续/急停/退出）。
 - `scripts/safety.py`：动作限幅、工作空间限制、速度限制、姿态/夹爪步进限制、文件急停。
 - `scripts/offline_replay_check.py`：离线回放检查脚本（用于先验证数据/动作分布）。
+- `scripts/pybullet_episode_start_check.py`：PyBullet 起点体检（把 episode 起点映射到 base 后做 IK/关节裕量检查）。
 - `scripts/protocol_runner.py`：空载/简化任务回合记录。
 - `scripts/visualize_realtime.py`：读取实时日志，输出统计 summary 与可视化图。
 
@@ -113,6 +114,15 @@ cd /home/icrlab/tactile_work_Wy/lerobot
 ```bash
 /home/icrlab/miniforge3/envs/lerobot/bin/python -m pip install matplotlib opencv-python
 ```
+
+PyBullet 起点体检依赖（推荐安装）：
+
+```bash
+/home/icrlab/miniforge3/envs/lerobot/bin/python -m pip install pybullet matplotlib
+```
+
+若是无桌面服务器，仅做离线体检可直接使用 `--gui` 关闭（默认）。
+若要打开 `--gui`，需有可用 X11/桌面转发环境。
 
 说明：
 
@@ -309,6 +319,45 @@ cd /home/icrlab/tactile_work_Wy/lerobot
 
 - 该脚本不会连接机械臂，也不会发送动作。
 - 如果未安装 `matplotlib`，仍会生成 `csv/json`，但不输出 png 图。
+
+## 4.7 PyBullet 起点体检（建议先做）
+
+用途：
+
+- 检查“训练 episode 起点”在当前 `manual_origin/manual_rotation` 映射下是否可达、是否贴近关节限位。
+- 输出 `usable_start`，快速筛掉不适合作为真机起始姿态的样本。
+
+你需要准备：
+
+1. `deployment_config.generated.json`（已包含本次采集对应的 `manual_origin/manual_rotation`）。
+2. RM65 的 URDF 文件路径（例如 `rm_65_description.urdf`）。
+3. 若 URDF 内使用 `package://rm_65_description/...`，提供包根目录映射。
+
+示例（无 GUI，检查第 0~4 条 episode 的前 4 帧）：
+
+```bash
+cd /home/icrlab/tactile_work_Wy/lerobot
+/home/icrlab/miniforge3/envs/lerobot/bin/python real_test/scripts/pybullet_episode_start_check.py \
+  --config real_test/config/deployment_config.generated.json \
+  --urdf-path /path/to/rm_65_description/urdf/rm_65_description.urdf \
+  --urdf-package-roots rm_65_description=/path/to/rm_65_description \
+  --ee-link-name Link6 \
+  --episodes 0,1,2,3,4 \
+  --steps 0,1,2,3 \
+  --output-dir real_test/results/start_pose_check
+```
+
+输出文件：
+
+- `real_test/results/start_pose_check/start_pose_check.csv`
+- `real_test/results/start_pose_check/start_pose_check_summary.json`
+- `real_test/results/start_pose_check/start_pose_scatter_base.png`（装了 matplotlib 时）
+
+重点看：
+
+- `usable_ratio`：可用起点比例（越高越好）。
+- `ik_ok_ratio`：IK 是否稳定命中目标位姿。
+- `soft_margin_ok_ratio`：关节离限位是否有足够裕量。
 
 ## 5. 常见问题
 
