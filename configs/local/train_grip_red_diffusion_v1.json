@@ -1,0 +1,44 @@
+{
+  "dataset": {
+    "repo_id": "local/grip_red_batch3",
+    "root": "/home/icrlab/tactile_work_Wy/data/grip_red/batch_3/lerobot_v3",
+    "use_imagenet_stats": true,
+    "streaming": false
+  },
+  "policy": {
+    "type": "diffusion",
+    "device": "cuda",
+    "use_amp": true,
+    "push_to_hub": false,
+    "n_obs_steps": 3,
+    "horizon": 16,
+    "n_action_steps": 4,
+    "drop_n_last_frames": 10,
+    "vision_backbone": "resnet18",
+    "crop_is_random": false,
+    "noise_scheduler_type": "DDPM",
+    "num_train_timesteps": 100,
+    "optimizer_lr": 3e-05,
+    "scheduler_name": "cosine",
+    "scheduler_warmup_steps": 3000,
+    "do_mask_loss_for_padding": true
+  },
+  "output_dir": "/home/icrlab/tactile_work_Wy/lerobot/outputs/train/grip_red_diffusion_v1_robust",
+  "job_name": "grip_red_diffusion_v1_robust",
+  "resume": false,
+  "seed": 42,
+  "cudnn_deterministic": false,
+  "num_workers": 6,
+  "batch_size": 8,
+  "steps": 60000,
+  "eval_freq": 0,
+  "log_freq": 50,
+  "save_checkpoint": true,
+  "save_freq": 2000,
+  "use_policy_training_preset": true,
+  "wandb": {
+    "enable": false,
+    "project": "lerobot"
+  },
+  "rename_map": {}
+}
