@@ -33,6 +33,8 @@
 
 - `action_schema.coordinate_frame == manual_relative_frame`
 - `robot_adapter.config.policy_frame == manual_relative_frame`
+- `robot_adapter.config.input_pose_represents == flange`
+- `robot_adapter.config.solve_frame == flange`
 - `startup_pose.map_startup_to_policy_origin == false`（默认）
 
 ## 2. 关键命令
@@ -100,6 +102,7 @@ cd /Users/wangyi/Vscode/vscode_python_work/tactile_work/my_lerobot
 python real_test/scripts/build_deployment_config.py \
   --template /Users/wangyi/Vscode/vscode_python_work/tactile_work/data/<dataset_name>/lerobot_v3/reports/deployment_manual_frame_template.json \
   --base-config /Users/wangyi/Vscode/vscode_python_work/tactile_work/my_lerobot/real_test/config/deployment_config.json \
+  --best-config /home/icrlab/tactile_work_Wy/data/grip_red/batch_3/optimize_shape_prior/best_config.yaml \
   --output /Users/wangyi/Vscode/vscode_python_work/tactile_work/my_lerobot/real_test/config/deployment_config.generated.json
 ```
 
@@ -140,6 +143,8 @@ python real_test/scripts/realtime_inference.py \
 - `startup_pose.map_startup_to_policy_origin=false`：禁用 startup 锚点重映射，保持绝对 manual 语义。
 - `robot_adapter.config.lock_work_tool_frame=true` + `frame_lock_require_expected_names=true`：frame 锁必须有 expected 名称。
 - `robot_adapter.config.runtime_joint_guard.enabled=true`：每步下发前做 IK+软限位/奇异性等关节预检。
+- `robot_adapter.config.frames.T_B_from_pose_frame`：统一 `manual_relative_frame -> base` 主映射。
+- `robot_adapter.config.frames.T_flange_to_tcp`：仅用于 flange/TCP 语义切换与评估，不改变训练目标定义。
 
 ## 4. 非真机验证建议
 

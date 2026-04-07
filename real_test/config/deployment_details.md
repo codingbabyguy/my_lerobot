@@ -56,8 +56,15 @@ config.gripper_*	夹爪映射和控制参数	按夹爪实测标定
 config.completion_poll_dt_s	完成判定轮询周期	0.02~0.05
 config.completion_pose_tol_m	到位位置容差	实机可适当放宽
 config.completion_rot_tol_rad	到位姿态容差	实机可适当放宽
+config.frames.T_B_from_pose_frame	策略/采集坐标系(M)到机器人base(B)	部署时主映射，推荐优先配置
+config.frames.T_flange_to_tcp	法兰(F)到工具TCP(T)固定外参	仅在 TCP 语义或评估时使用
+config.frames.T_pose_to_tcp	输入pose定义点到TCP的变换	若输入已是flange，必须保持单位变换
 config.manual_origin	采集标定参考系原点	来自 calibration_params.npz
 config.manual_rotation	采集标定参考系旋转矩阵	来自 calibration_params.npz
+config.input_pose_represents	输入pose语义（flange/tcp）	当前应设 flange
+config.solve_frame	IK求解语义（flange/tcp）	当前应设 flange 且与 input_pose_represents 一致
+config.sdk_pose_represents	RM SDK pose语义（flange/tcp）	建议与你控制器工具定义一致
+config.progress_log_interval	动作进度日志输出间隔	建议 20~100（调试期可更小）
 config.lock_work_tool_frame	连接时检查 RM work/tool frame	true
 config.frame_lock_require_expected_names	frame lock 是否强制要求 expected 名称	建议 true（为空即阻断启动）
 config.expected_work_frame_names	允许的 work frame 名称列表	先用 check_rm_frames.py 实测后填写

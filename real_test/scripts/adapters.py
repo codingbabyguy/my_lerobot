@@ -12,7 +12,14 @@ from typing import Any
 
 import numpy as np
 
-from safety import matrix_to_rot6d, rot6d_to_matrix
+try:
+    from frame_transforms import FrameTransformChain, matrix_to_rpy_xyz
+except ModuleNotFoundError:  # pragma: no cover
+    from .frame_transforms import FrameTransformChain, matrix_to_rpy_xyz
+try:
+    from safety import matrix_to_rot6d, rot6d_to_matrix
+except ModuleNotFoundError:  # pragma: no cover
+    from .safety import matrix_to_rot6d, rot6d_to_matrix
 
 
 class BaseRobotAdapter(abc.ABC):
@@ -458,21 +465,36 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._camera = None
         self._camera_source = "placeholder"
         self._cv2 = None
-        manual_origin = robot_cfg.get("manual_origin")
-        manual_rotation = robot_cfg.get("manual_rotation")
-        if manual_origin is None or manual_rotation is None:
+        self._frame_chain = FrameTransformChain.from_robot_config(robot_cfg)
+        # Backward-compatible aliases used by existing debug scripts.
+        self._manual_origin_base = self._frame_chain.t_B_from_M.copy()
+        self._manual_rotation_base = self._frame_chain.R_B_from_M.copy()
+
+        pose_repr = str(
+            robot_cfg.get("input_pose_represents", robot_cfg.get("sdk_pose_represents", "flange"))
+        ).strip().lower()
+        solve_frame = str(robot_cfg.get("solve_frame", pose_repr)).strip().lower()
+        if pose_repr not in {"flange", "tcp"}:
+            raise ValueError("robot_adapter.config.input_pose_represents must be 'flange' or 'tcp'")
+        if solve_frame not in {"flange", "tcp"}:
+            raise ValueError("robot_adapter.config.solve_frame must be 'flange' or 'tcp'")
+        if solve_frame != pose_repr:
             raise ValueError(
-                "manual_origin and manual_rotation are required. "
-                "Use calibration_params.npz values from data collection."
+                "robot_adapter.config.solve_frame must match input_pose_represents. "
+                f"Got input_pose_represents={pose_repr}, solve_frame={solve_frame}"
             )
-        self._manual_origin_base = _as_float_vector(manual_origin, 3)
-        self._manual_rotation_base = _as_float_matrix(manual_rotation, (3, 3))
+        self._input_pose_represents = pose_repr
+        self._solve_frame = solve_frame
+        self._sdk_pose_represents = pose_repr
+        self._progress_log_interval = int(robot_cfg.get("progress_log_interval", 50))
+        if self._progress_log_interval <= 0:
+            self._progress_log_interval = 50
+        self._action_counter = 0
         self._workspace_clip_in_adapter = bool(robot_cfg.get("workspace_clip_in_adapter", False))
         self._workspace_bounds_base = robot_cfg.get(
             "workspace_bounds_base",
             robot_cfg.get("workspace_bounds_world", {}),
         )
-        self._use_sdk_pose_transform = bool(robot_cfg.get("use_sdk_pose_transform", True))
         self._lock_work_tool_frame = bool(robot_cfg.get("lock_work_tool_frame", True))
         self._frame_lock_require_expected_names = bool(robot_cfg.get("frame_lock_require_expected_names", True))
         self._expected_work_frame_names = [
@@ -502,11 +524,6 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._runtime_require_algo_checks = bool(runtime_joint_guard.get("require_algo_checks", False))
         self._runtime_guard_fail_on_ik_error = bool(runtime_joint_guard.get("fail_on_ik_error", True))
 
-        ortho_check = self._manual_rotation_base.T @ self._manual_rotation_base
-        if not np.allclose(ortho_check, np.eye(3), atol=1e-5):
-            raise ValueError("manual_rotation must be orthonormal")
-        if float(np.linalg.det(self._manual_rotation_base)) <= 0.0:
-            raise ValueError("manual_rotation must be a right-handed rotation matrix")
         if self._workspace_clip_in_adapter and not isinstance(self._workspace_bounds_base, dict):
             raise ValueError("workspace_bounds_base must be a dict when workspace_clip_in_adapter=true")
         if self._runtime_joint_limit_margin_deg < 0.0:
@@ -694,14 +711,10 @@ class GermanArmAdapter(BaseRobotAdapter):
         return pos_base, rot_base, pose6
 
     def _base_to_manual_pose(self, pos_base: np.ndarray, rot_base: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        pos_manual = self._manual_rotation_base.T @ (pos_base - self._manual_origin_base)
-        rot_manual = self._manual_rotation_base.T @ rot_base
-        return pos_manual, rot_manual
+        return self._frame_chain.base_flange_to_manual_flange(pos_base, rot_base)
 
     def _manual_to_base_pose(self, pos_manual: np.ndarray, rot_manual: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        pos_base = self._manual_origin_base + self._manual_rotation_base @ pos_manual
-        rot_base = self._manual_rotation_base @ rot_manual
-        return pos_base, rot_base
+        return self._frame_chain.manual_flange_to_base_flange(pos_manual, rot_manual)
 
     def _clip_base_position(self, pos_base: np.ndarray) -> np.ndarray:
         pos = np.asarray(pos_base, dtype=np.float64).copy()
@@ -818,6 +831,23 @@ class GermanArmAdapter(BaseRobotAdapter):
             _, _, pose6 = self._read_current_pose_base()
             self._last_target_pose = pose6.copy()
             self._last_target_pose_base = pose6.copy()
+            t_b_rpy = matrix_to_rpy_xyz(self._frame_chain.R_B_from_M)
+            t_f_rpy = matrix_to_rpy_xyz(self._frame_chain.R_T_from_F)
+            print(
+                "[FRAME] policy_pose=manual_relative_frame(flange), "
+                f"input_pose_represents={self._input_pose_represents}, "
+                f"solve_frame={self._solve_frame}"
+            )
+            print(
+                "[FRAME] T_B_from_pose_frame: "
+                f"xyz={self._frame_chain.t_B_from_M.round(6).tolist()} "
+                f"rpy_rad={t_b_rpy.round(6).tolist()}"
+            )
+            print(
+                "[FRAME] T_flange_to_tcp: "
+                f"xyz={self._frame_chain.t_T_from_F.round(6).tolist()} "
+                f"rpy_rad={t_f_rpy.round(6).tolist()}"
+            )
             if self._connected_work_frame_name is not None or self._connected_tool_frame_name is not None:
                 print(
                     "[INFO] RM frame lock: "
@@ -830,11 +860,6 @@ class GermanArmAdapter(BaseRobotAdapter):
                     f"warn_only={int(self._runtime_joint_guard_warn_only)}, "
                     f"margin_deg={self._runtime_joint_limit_margin_deg:.2f}, "
                     f"max_joint_step_deg={self._runtime_joint_max_step_deg:.2f}"
-                )
-            if self._use_sdk_pose_transform and not self._lock_work_tool_frame:
-                print(
-                    "[WARN] use_sdk_pose_transform=true but frame lock is disabled; "
-                    "ensure rm_get_current_arm_state pose semantics match training frame."
                 )
             self._connect_camera()
         except Exception:
@@ -895,8 +920,13 @@ class GermanArmAdapter(BaseRobotAdapter):
         if not self.connected or self._robot is None:
             raise RuntimeError("GermanArmAdapter is not connected")
 
-        pos_base, rot_base, _ = self._read_current_pose_base()
-        pos_manual, rot_manual = self._base_to_manual_pose(pos_base, rot_base)
+        pos_base_sdk, rot_base_sdk, _ = self._read_current_pose_base()
+        pos_base_flange, rot_base_flange = self._frame_chain.sdk_pose_to_base_flange(
+            pos_base_sdk,
+            rot_base_sdk,
+            sdk_pose_represents=self._sdk_pose_represents,
+        )
+        pos_manual, rot_manual = self._base_to_manual_pose(pos_base_flange, rot_base_flange)
         rot6d = matrix_to_rot6d(rot_manual)
 
         obs_state = np.zeros(10, dtype=np.float32)
@@ -924,18 +954,31 @@ class GermanArmAdapter(BaseRobotAdapter):
             raise KeyError(f"Missing action key: {exc}") from exc
 
         rot_manual = rot6d_to_matrix(rot6d)
-        pos_base, rot_base = self._manual_to_base_pose(pos_manual, rot_manual)
-        pos_base = self._clip_base_position(pos_base)
-        euler = _matrix_to_euler_xyz(rot_base)
+        pos_base_flange, rot_base_flange = self._manual_to_base_pose(pos_manual, rot_manual)
+        pos_base_flange = self._clip_base_position(pos_base_flange)
+        pos_base_cmd, rot_base_cmd = self._frame_chain.base_flange_to_sdk_pose(
+            pos_base_flange,
+            rot_base_flange,
+            sdk_pose_represents=self._sdk_pose_represents,
+        )
+        euler = _matrix_to_euler_xyz(rot_base_cmd)
 
         pose = [
-            float(pos_base[0]),
-            float(pos_base[1]),
-            float(pos_base[2]),
+            float(pos_base_cmd[0]),
+            float(pos_base_cmd[1]),
+            float(pos_base_cmd[2]),
             float(euler[0]),
             float(euler[1]),
             float(euler[2]),
         ]
+        self._action_counter += 1
+        if self._action_counter <= 5 or (self._action_counter % self._progress_log_interval == 0):
+            print(
+                f"[ACTION {self._action_counter}] "
+                f"manual_xyz={pos_manual.round(4).tolist()} "
+                f"base_flange_xyz={pos_base_flange.round(4).tolist()} "
+                f"cmd_{self._sdk_pose_represents}_xyz={pos_base_cmd.round(4).tolist()}"
+            )
         self._runtime_precheck_target_pose(pose)
         self._last_target_pose = np.array(pose, dtype=np.float64)
         self._last_target_pose_base = self._last_target_pose.copy()

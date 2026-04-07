@@ -173,6 +173,57 @@ def _validate_coordinate_contract(cfg: dict) -> dict[str, bool]:
             "robot_adapter.config.policy_frame must be manual_relative_frame. "
             f"Got {adapter_cfg.get('policy_frame')!r}"
         )
+    frames_cfg = adapter_cfg.get("frames", {})
+    if frames_cfg is not None and not isinstance(frames_cfg, dict):
+        raise ValueError("robot_adapter.config.frames must be a dict when provided")
+    if isinstance(frames_cfg, dict) and "T_B_from_pose_frame" in frames_cfg:
+        t_b = frames_cfg.get("T_B_from_pose_frame", {})
+        xyz = t_b.get("xyz", [])
+        rpy = t_b.get("rpy_rad", [])
+        if not isinstance(xyz, (list, tuple)) or len(xyz) != 3:
+            raise ValueError("robot_adapter.config.frames.T_B_from_pose_frame.xyz must be length-3")
+        if not isinstance(rpy, (list, tuple)) or len(rpy) != 3:
+            raise ValueError("robot_adapter.config.frames.T_B_from_pose_frame.rpy_rad must be length-3")
+    else:
+        if "manual_origin" not in adapter_cfg or "manual_rotation" not in adapter_cfg:
+            raise ValueError(
+                "Missing base mapping config. Provide either robot_adapter.config.frames.T_B_from_pose_frame "
+                "or legacy manual_origin/manual_rotation."
+            )
+
+    if isinstance(frames_cfg, dict) and "T_flange_to_tcp" in frames_cfg:
+        t_ft = frames_cfg.get("T_flange_to_tcp", {})
+        xyz = t_ft.get("xyz", [])
+        rpy = t_ft.get("rpy_rad", [])
+        if not isinstance(xyz, (list, tuple)) or len(xyz) != 3:
+            raise ValueError("robot_adapter.config.frames.T_flange_to_tcp.xyz must be length-3")
+        if not isinstance(rpy, (list, tuple)) or len(rpy) != 3:
+            raise ValueError("robot_adapter.config.frames.T_flange_to_tcp.rpy_rad must be length-3")
+
+    input_pose_represents = str(
+        adapter_cfg.get("input_pose_represents", adapter_cfg.get("sdk_pose_represents", "flange"))
+    ).strip().lower()
+    solve_frame = str(adapter_cfg.get("solve_frame", input_pose_represents)).strip().lower()
+    if input_pose_represents not in {"flange", "tcp"}:
+        raise ValueError("robot_adapter.config.input_pose_represents must be 'flange' or 'tcp'")
+    if solve_frame not in {"flange", "tcp"}:
+        raise ValueError("robot_adapter.config.solve_frame must be 'flange' or 'tcp'")
+    if solve_frame != input_pose_represents:
+        raise ValueError(
+            "robot_adapter.config.solve_frame must match input_pose_represents. "
+            f"Got input_pose_represents={input_pose_represents}, solve_frame={solve_frame}"
+        )
+    if isinstance(frames_cfg, dict) and "T_pose_to_tcp" in frames_cfg and input_pose_represents == "flange":
+        t_pt = frames_cfg.get("T_pose_to_tcp", {})
+        xyz = np.asarray(t_pt.get("xyz", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(-1)
+        rpy = np.asarray(t_pt.get("rpy_rad", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(-1)
+        if xyz.shape[0] != 3 or rpy.shape[0] != 3:
+            raise ValueError("robot_adapter.config.frames.T_pose_to_tcp must provide xyz/rpy_rad length-3")
+        if (not np.allclose(xyz, np.zeros(3), atol=1e-9)) or (not np.allclose(rpy, np.zeros(3), atol=1e-9)):
+            raise ValueError(
+                "For flange-input pipeline, robot_adapter.config.frames.T_pose_to_tcp must be identity "
+                "(xyz=[0,0,0], rpy_rad=[0,0,0])."
+            )
 
     map_startup_to_policy_origin = bool(startup_cfg.get("map_startup_to_policy_origin", False))
     allow_startup_policy_anchor = bool(startup_cfg.get("allow_startup_policy_anchor", False))
@@ -464,6 +515,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = _load_json(args.config)
+    print(f"[INIT] config={Path(args.config).expanduser().resolve()}")
     action_names = cfg["action_schema"]["names"]
     contract = _validate_coordinate_contract(cfg)
     startup_cfg = cfg.get("startup_pose", {})
@@ -528,9 +580,14 @@ def main() -> None:
     estop = EStop(cfg["estop"]["enabled"], cfg["estop"]["trigger_file"])
     keyboard = KeyboardController(enabled=bool(cfg["control"].get("keyboard_enabled", True)))
 
+    print(
+        "[INIT] loading dataset metadata: "
+        f"repo_id={cfg['dataset']['repo_id']} root={cfg['dataset']['root']}"
+    )
     dataset = LeRobotDataset(cfg["dataset"]["repo_id"], root=cfg["dataset"]["root"])
 
     pretrained_path = cfg["checkpoint"]["pretrained_model_path"]
+    print(f"[INIT] loading policy config from pretrained: {pretrained_path}")
     from lerobot.configs.policies import PreTrainedConfig
     # Isolate this script's CLI args from lerobot config parser.
     argv_backup = list(sys.argv)
@@ -543,6 +600,7 @@ def main() -> None:
     policy_cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
     policy_cfg.pretrained_path = pretrained_path
 
+    print(f"[INIT] building policy on device={policy_cfg.device}")
     policy = make_policy(policy_cfg, ds_meta=dataset.meta)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy_cfg,
@@ -560,6 +618,7 @@ def main() -> None:
 
     robot_adapter_cfg = dict(cfg["robot_adapter"]["config"])
 
+    print(f"[INIT] building robot adapter: {cfg['robot_adapter']['name']}")
     adapter = make_robot_adapter(
         cfg["robot_adapter"]["name"],
         robot_adapter_cfg,

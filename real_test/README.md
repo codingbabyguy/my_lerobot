@@ -165,6 +165,7 @@ cd /home/icrlab/tactile_work_Wy/lerobot
 /home/icrlab/miniforge3/envs/lerobot/bin/python real_test/scripts/build_deployment_config.py \
   --template /path/to/lerobot_v3/reports/deployment_manual_frame_template.json \
   --base-config real_test/config/deployment_config.json \
+  --best-config /path/to/optimize_shape_prior/best_config.yaml \
   --output real_test/config/deployment_config.generated.json
 ```
 

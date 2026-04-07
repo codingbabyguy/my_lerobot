@@ -23,9 +23,15 @@ This document freezes the action contract between policy output and the real rob
 | 8     | rot6d_5  | Rotation 6D second column, element 2    | unitless  | manual_relative_frame |
 | 9     | gripper  | Gripper open ratio (0 close, 1 open)    | normalized| gripper    |
 
-At runtime, adapter maps this manual frame action into RM base frame pose by:
-- `p_base = manual_origin + manual_rotation @ p_manual`
-- `R_base = manual_rotation @ R_manual`
+At runtime, adapter maps this manual-frame **flange pose** into RM base frame by:
+- `T_B_F = T_B_from_pose_frame * T_M_pose`
+- `T_B_T = T_B_F * T_F_T` (only when command/SDK pose is configured as TCP)
+
+Notes:
+- `T_B_from_pose_frame` is configured in `robot_adapter.config.frames.T_B_from_pose_frame`.
+- `T_F_T` is configured in `robot_adapter.config.frames.T_flange_to_tcp`.
+- `input_pose_represents` and `solve_frame` must be the same (`flange` in current RM65 pipeline).
+- `manual_origin/manual_rotation` are kept as compatibility mirrors of `T_B_from_pose_frame`.
 
 ## Rotation Convention
 
@@ -73,7 +79,8 @@ Robot adapter must consume the same keys and must not reorder dimensions.
 
 ## Deployment Checklist
 
-- Verify `manual_origin/manual_rotation` comes from the same collection calibration.
+- Verify `frames.T_B_from_pose_frame` comes from the same collection calibration.
+- Verify `frames.T_flange_to_tcp` matches your real tool geometry.
 - Verify RM current work/tool frame matches expected frame names before inference.
 - Verify gripper polarity (0 close, 1 open).
 - Verify action keys and order unchanged.

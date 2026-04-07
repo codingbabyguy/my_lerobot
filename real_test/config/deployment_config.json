@@ -125,13 +125,33 @@
         [-0.002141541, 0.005414721, 0.999983047],
         [0.979056838, 0.203584674, 0.000994353]
       ],
+      "frames": {
+        "T_B_from_pose_frame": {
+          "xyz": [0.4078497, -0.2628334, 0.04926792],
+          "rpy_rad": [1.5659121433496465, -1.3657759572808568, -3.131073417529867]
+        },
+        "T_flange_to_tcp": {
+          "xyz": [0.0, 0.0, 0.03103],
+          "rpy_rad": [0.0, 0.0, 3.14]
+        },
+        "T_pose_to_tcp": {
+          "xyz": [0.0, 0.0, 0.0],
+          "rpy_rad": [0.0, 0.0, 0.0]
+        }
+      },
       "policy_frame": "manual_relative_frame",
-      "use_sdk_pose_transform": true,
+      "input_pose_represents": "flange",
+      "solve_frame": "flange",
+      "sdk_pose_represents": "flange",
+      "progress_log_interval": 50,
       "lock_work_tool_frame": true,
       "frame_lock_require_expected_names": true,
       "expected_work_frame_names": [],
       "expected_tool_frame_names": [],
       "workspace_clip_in_adapter": false,
+      "ik_selection": {
+        "home_q_deg": [0, 0, 90, 0, 90, 0]
+      },
       "runtime_joint_guard": {
         "enabled": true,
         "warn_only": false,
