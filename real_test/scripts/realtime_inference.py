@@ -30,16 +30,14 @@ from lerobot.policies.utils import make_robot_action
 from lerobot.utils.control_utils import predict_action
 from lerobot.utils.device_utils import get_safe_torch_device
 
-from adapters import _matrix_to_euler_xyz, make_robot_adapter
+from adapters import make_robot_adapter
 from keyboard_control import KeyboardController
 from safety import ActionSafetyFilter, EStop, SafetyConfig, matrix_to_rot6d, rot6d_to_matrix
 from move_to_dataset_start_pose import (
     _check_joint_safety,
-    _positive_xyz_from_workspace_bounds,
     _read_joint_degree,
     _read_joint_limits,
     _safe_dof,
-    _to_len7_joint,
     _wait_joint_close,
 )
 
@@ -227,6 +225,16 @@ def _validate_coordinate_contract(cfg: dict) -> dict[str, bool]:
 
     map_startup_to_policy_origin = bool(startup_cfg.get("map_startup_to_policy_origin", False))
     allow_startup_policy_anchor = bool(startup_cfg.get("allow_startup_policy_anchor", False))
+    startup_enabled = bool(startup_cfg.get("enabled", True))
+    if startup_enabled:
+        startup_npz = startup_cfg.get("selected_trajectory_npz")
+        if not isinstance(startup_npz, str) or len(startup_npz.strip()) == 0:
+            raise ValueError(
+                "startup_pose.selected_trajectory_npz is required when startup_pose.enabled=true."
+            )
+        startup_npz_path = Path(startup_npz).expanduser().resolve()
+        if not startup_npz_path.is_file():
+            raise FileNotFoundError(f"startup selected_trajectory npz not found: {startup_npz_path}")
     if map_startup_to_policy_origin and not allow_startup_policy_anchor:
         raise ValueError(
             "startup_pose.map_startup_to_policy_origin=true introduces startup-relative semantics. "
@@ -322,80 +330,57 @@ def _map_state_policy_to_adapter(
     return out
 
 
-def _build_startup_target_state(
-    cfg: dict,
-    current_state: np.ndarray,
-) -> tuple[np.ndarray, str]:
+def _load_startup_q_selected(cfg: dict, dof: int) -> tuple[np.ndarray, str, int]:
     startup_cfg = cfg.get("startup_pose", {})
     if not isinstance(startup_cfg, dict):
         startup_cfg = {}
-
-    mode = str(startup_cfg.get("mode", "safe_positive")).lower()
-    target = current_state.astype(np.float64).copy()
-    source = "current"
-
-    if mode in {"off", "disabled", "none"}:
-        return target, "startup_disabled"
-    if mode in {"home_q", "home", "best_home_q"}:
-        # In home_q mode, startup target is specified in joint space
-        # (robot_adapter.config.ik_selection.home_q_deg), not by cartesian xyz.
-        return target, "startup_pose.mode=home_q"
-
-    if "xyz" in startup_cfg and isinstance(startup_cfg["xyz"], (list, tuple)) and len(startup_cfg["xyz"]) == 3:
-        xyz = np.asarray(startup_cfg["xyz"], dtype=np.float64).reshape(3)
-        source = "startup_pose.xyz"
-    elif mode == "safe_positive":
-        xyz = _positive_xyz_from_workspace_bounds(cfg["safety"].get("workspace_bounds"), current_state[:3])
-        source = "safe_positive_from_workspace_bounds"
-    else:
+    npz_path = startup_cfg.get("selected_trajectory_npz")
+    if not isinstance(npz_path, str) or len(npz_path.strip()) == 0:
         raise ValueError(
-            "startup_pose.mode must be 'safe_positive' or 'home_q' (or provide startup_pose.xyz). "
-            f"Got mode={mode!r}."
+            "startup_pose.selected_trajectory_npz is required and must point to selected_trajectory.npz"
         )
-    target[:3] = xyz
+    npz_file = Path(npz_path).expanduser().resolve()
+    if not npz_file.is_file():
+        raise FileNotFoundError(f"startup selected_trajectory npz not found: {npz_file}")
 
-    keep_rot = bool(startup_cfg.get("keep_current_rotation", True))
-    if not keep_rot:
-        rot6d = startup_cfg.get("rot6d")
-        if isinstance(rot6d, (list, tuple)) and len(rot6d) == 6:
-            target[3:9] = np.asarray(rot6d, dtype=np.float64).reshape(6)
+    try:
+        with np.load(str(npz_file), allow_pickle=False) as data:
+            if "q_selected" not in data:
+                raise KeyError(f"{npz_file} does not contain key 'q_selected'")
+            q_selected = np.asarray(data["q_selected"], dtype=np.float64)
+    except Exception as exc:
+        raise RuntimeError(f"failed to load startup npz: {npz_file}") from exc
 
-    if "gripper" in startup_cfg:
-        target[9] = float(np.clip(float(startup_cfg["gripper"]), 0.0, 1.0))
-
-    return target, source
-
-
-def _load_startup_home_q(cfg: dict, dof: int) -> np.ndarray | None:
-    robot_cfg = cfg.get("robot_adapter", {}).get("config", {})
-    if not isinstance(robot_cfg, dict):
-        return None
-    ik_selection = robot_cfg.get("ik_selection", {})
-    if not isinstance(ik_selection, dict):
-        return None
-    home_q = ik_selection.get("home_q_deg")
-    if not isinstance(home_q, (list, tuple, np.ndarray)):
-        return None
-    arr = np.asarray(home_q, dtype=np.float64).reshape(-1)
-    if arr.shape[0] < dof:
-        return None
-    return arr[:dof].copy()
+    if q_selected.ndim != 2 or q_selected.shape[0] <= 0:
+        raise ValueError(
+            f"invalid q_selected shape in {npz_file}: expected [N,dof], got {q_selected.shape}"
+        )
+    q_index = int(startup_cfg.get("q_index", 0))
+    if q_index < 0:
+        q_index += int(q_selected.shape[0])
+    if q_index < 0 or q_index >= int(q_selected.shape[0]):
+        raise IndexError(
+            f"startup q_index out of range: q_index={q_index}, num_rows={int(q_selected.shape[0])}"
+        )
+    row = np.asarray(q_selected[q_index], dtype=np.float64).reshape(-1)
+    if row.shape[0] < dof:
+        raise ValueError(
+            f"q_selected[{q_index}] length mismatch: {row.shape[0]} < dof({dof}) in {npz_file}"
+        )
+    return row[:dof].copy(), str(npz_file), int(q_index)
 
 
 def _move_to_startup_state_joint(
     adapter,
     cfg: dict,
-    current_state: np.ndarray,
-    target_state: np.ndarray,
 ) -> None:
     startup_cfg = cfg.get("startup_pose", {})
     if not isinstance(startup_cfg, dict):
         startup_cfg = {}
 
     robot = getattr(adapter, "_robot", None)
-    rm_module = getattr(adapter, "_rm_module", None)
-    if robot is None or rm_module is None:
-        raise RuntimeError("startup joint move requires connected RM robot + SDK module")
+    if robot is None:
+        raise RuntimeError("startup joint move requires connected RM robot")
 
     raw_joint = np.asarray(robot.rm_get_joint_degree()[1], dtype=np.float64).reshape(-1)
     if raw_joint.size <= 0:
@@ -410,44 +395,9 @@ def _move_to_startup_state_joint(
     if np.any(q_min_soft >= q_max_soft):
         q_min_soft = q_min.copy()
         q_max_soft = q_max.copy()
-
-    startup_mode = str(startup_cfg.get("mode", "safe_positive")).strip().lower()
-    if startup_mode in {"home_q", "home", "best_home_q"}:
-        home_q = _load_startup_home_q(cfg, dof)
-        if home_q is None:
-            raise RuntimeError(
-                "startup_pose.mode=home_q requires robot_adapter.config.ik_selection.home_q_deg "
-                f"with length >= dof({dof})."
-            )
-        q1 = home_q
-        print(f"[STARTUP] joint target source=ik_selection.home_q_deg, q_target={q1.tolist()}")
-    else:
-        pos1 = target_state[:3]
-        rot1 = target_state[3:9]
-        pos1_base, rot1_base = adapter._manual_to_base_pose(pos1, rot6d_to_matrix(rot1))
-        euler1_base = _matrix_to_euler_xyz(rot1_base)
-        target_pose_base = [
-            float(pos1_base[0]),
-            float(pos1_base[1]),
-            float(pos1_base[2]),
-            float(euler1_base[0]),
-            float(euler1_base[1]),
-            float(euler1_base[2]),
-        ]
-
-        ik_params = rm_module.rm_inverse_kinematics_params_t(
-            q_in=_to_len7_joint(q0, dof),
-            q_pose=target_pose_base,
-            flag=1,
-        )
-        ik_ret, q_target_raw = robot.rm_algo_inverse_kinematics(ik_params)
-        if int(ik_ret) != 0:
-            raise RuntimeError(f"startup IK failed with code {ik_ret}")
-        q_target_raw = np.asarray(q_target_raw, dtype=np.float64).reshape(-1)
-        if q_target_raw.size < dof:
-            raise RuntimeError(f"startup IK output length mismatch: {q_target_raw.size} < dof {dof}")
-        q1 = q_target_raw[:dof].copy()
-        print(f"[STARTUP] joint target source=cartesian_ik, q_target={q1.tolist()}")
+    q1, npz_file, q_index = _load_startup_q_selected(cfg=cfg, dof=dof)
+    print(f"[STARTUP] joint target source={npz_file} q_selected[{q_index}]")
+    print(f"[STARTUP] joint q_target(deg)={q1.tolist()}")
 
     ok_target, target_issues = _check_joint_safety(
         robot,
@@ -689,17 +639,10 @@ def main() -> None:
                 raise RuntimeError(
                     f"Invalid startup observation.state shape: expected {len(action_names)}, got {startup_state.shape[0]}"
                 )
-            target_state, target_source = _build_startup_target_state(cfg, startup_state)
-            print(f"[STARTUP] source={target_source}")
             print(f"[STARTUP] current xyz={startup_state[:3].tolist()}")
-            print(f"[STARTUP] target  xyz={target_state[:3].tolist()}")
-            if str(target_source).strip().lower() == "startup_pose.mode=home_q":
-                print("[STARTUP] note: cartesian xyz target is ignored in home_q mode; using ik_selection.home_q_deg")
             _move_to_startup_state_joint(
                 adapter=adapter,
                 cfg=cfg,
-                current_state=startup_state,
-                target_state=target_state,
             )
             startup_obs = adapter.get_observation()
             startup_state = np.asarray(startup_obs.get("observation.state"), dtype=np.float64).reshape(-1)
