@@ -336,6 +336,10 @@ def _build_startup_target_state(
 
     if mode in {"off", "disabled", "none"}:
         return target, "startup_disabled"
+    if mode in {"home_q", "home", "best_home_q"}:
+        # In home_q mode, startup target is specified in joint space
+        # (robot_adapter.config.ik_selection.home_q_deg), not by cartesian xyz.
+        return target, "startup_pose.mode=home_q"
 
     if "xyz" in startup_cfg and isinstance(startup_cfg["xyz"], (list, tuple)) and len(startup_cfg["xyz"]) == 3:
         xyz = np.asarray(startup_cfg["xyz"], dtype=np.float64).reshape(3)
@@ -345,7 +349,7 @@ def _build_startup_target_state(
         source = "safe_positive_from_workspace_bounds"
     else:
         raise ValueError(
-            "startup_pose.mode must be 'safe_positive' (or provide startup_pose.xyz). "
+            "startup_pose.mode must be 'safe_positive' or 'home_q' (or provide startup_pose.xyz). "
             f"Got mode={mode!r}."
         )
     target[:3] = xyz
@@ -360,6 +364,22 @@ def _build_startup_target_state(
         target[9] = float(np.clip(float(startup_cfg["gripper"]), 0.0, 1.0))
 
     return target, source
+
+
+def _load_startup_home_q(cfg: dict, dof: int) -> np.ndarray | None:
+    robot_cfg = cfg.get("robot_adapter", {}).get("config", {})
+    if not isinstance(robot_cfg, dict):
+        return None
+    ik_selection = robot_cfg.get("ik_selection", {})
+    if not isinstance(ik_selection, dict):
+        return None
+    home_q = ik_selection.get("home_q_deg")
+    if not isinstance(home_q, (list, tuple, np.ndarray)):
+        return None
+    arr = np.asarray(home_q, dtype=np.float64).reshape(-1)
+    if arr.shape[0] < dof:
+        return None
+    return arr[:dof].copy()
 
 
 def _move_to_startup_state_joint(
@@ -391,31 +411,43 @@ def _move_to_startup_state_joint(
         q_min_soft = q_min.copy()
         q_max_soft = q_max.copy()
 
-    pos1 = target_state[:3]
-    rot1 = target_state[3:9]
-    pos1_base, rot1_base = adapter._manual_to_base_pose(pos1, rot6d_to_matrix(rot1))
-    euler1_base = _matrix_to_euler_xyz(rot1_base)
-    target_pose_base = [
-        float(pos1_base[0]),
-        float(pos1_base[1]),
-        float(pos1_base[2]),
-        float(euler1_base[0]),
-        float(euler1_base[1]),
-        float(euler1_base[2]),
-    ]
+    startup_mode = str(startup_cfg.get("mode", "safe_positive")).strip().lower()
+    if startup_mode in {"home_q", "home", "best_home_q"}:
+        home_q = _load_startup_home_q(cfg, dof)
+        if home_q is None:
+            raise RuntimeError(
+                "startup_pose.mode=home_q requires robot_adapter.config.ik_selection.home_q_deg "
+                f"with length >= dof({dof})."
+            )
+        q1 = home_q
+        print(f"[STARTUP] joint target source=ik_selection.home_q_deg, q_target={q1.tolist()}")
+    else:
+        pos1 = target_state[:3]
+        rot1 = target_state[3:9]
+        pos1_base, rot1_base = adapter._manual_to_base_pose(pos1, rot6d_to_matrix(rot1))
+        euler1_base = _matrix_to_euler_xyz(rot1_base)
+        target_pose_base = [
+            float(pos1_base[0]),
+            float(pos1_base[1]),
+            float(pos1_base[2]),
+            float(euler1_base[0]),
+            float(euler1_base[1]),
+            float(euler1_base[2]),
+        ]
 
-    ik_params = rm_module.rm_inverse_kinematics_params_t(
-        q_in=_to_len7_joint(q0, dof),
-        q_pose=target_pose_base,
-        flag=1,
-    )
-    ik_ret, q_target_raw = robot.rm_algo_inverse_kinematics(ik_params)
-    if int(ik_ret) != 0:
-        raise RuntimeError(f"startup IK failed with code {ik_ret}")
-    q_target_raw = np.asarray(q_target_raw, dtype=np.float64).reshape(-1)
-    if q_target_raw.size < dof:
-        raise RuntimeError(f"startup IK output length mismatch: {q_target_raw.size} < dof {dof}")
-    q1 = q_target_raw[:dof].copy()
+        ik_params = rm_module.rm_inverse_kinematics_params_t(
+            q_in=_to_len7_joint(q0, dof),
+            q_pose=target_pose_base,
+            flag=1,
+        )
+        ik_ret, q_target_raw = robot.rm_algo_inverse_kinematics(ik_params)
+        if int(ik_ret) != 0:
+            raise RuntimeError(f"startup IK failed with code {ik_ret}")
+        q_target_raw = np.asarray(q_target_raw, dtype=np.float64).reshape(-1)
+        if q_target_raw.size < dof:
+            raise RuntimeError(f"startup IK output length mismatch: {q_target_raw.size} < dof {dof}")
+        q1 = q_target_raw[:dof].copy()
+        print(f"[STARTUP] joint target source=cartesian_ik, q_target={q1.tolist()}")
 
     ok_target, target_issues = _check_joint_safety(
         robot,
@@ -661,6 +693,8 @@ def main() -> None:
             print(f"[STARTUP] source={target_source}")
             print(f"[STARTUP] current xyz={startup_state[:3].tolist()}")
             print(f"[STARTUP] target  xyz={target_state[:3].tolist()}")
+            if str(target_source).strip().lower() == "startup_pose.mode=home_q":
+                print("[STARTUP] note: cartesian xyz target is ignored in home_q mode; using ik_selection.home_q_deg")
             _move_to_startup_state_joint(
                 adapter=adapter,
                 cfg=cfg,

@@ -7,6 +7,7 @@ import math
 import importlib
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -176,6 +177,29 @@ def _to_len7_joint(q_deg: np.ndarray, dof: int) -> list[float]:
     n = min(int(dof), 7, int(q_deg.shape[0]))
     out[:n] = q_deg[:n]
     return out.tolist()
+
+
+@dataclass
+class OnlineIKCandidate:
+    q_deg: np.ndarray
+    source: str
+    total_cost: float
+    pos_err_m: float = 0.0
+    rot_err_rad: float = 0.0
+    limit_margin_deg: float = 0.0
+    singular_metric: float = 1.0
+    transition_l2_rad: float = 0.0
+    transition_linf_rad: float = 0.0
+    wrist_flip_raw: float = 0.0
+    branch_jump: bool = False
+    hard_step_violation: bool = False
+    shape_cost: float = 0.0
+    elbow_sign_cost: float = 0.0
+    elbow_halfspace_cost: float = 0.0
+    home_dist_rad: float = 0.0
+    center_cost: float = 0.0
+    safety_ok: bool = True
+    safety_issues: list[str] = field(default_factory=list)
 
 
 def _check_joint_safety(
@@ -523,6 +547,24 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._runtime_enable_singularity_check = bool(runtime_joint_guard.get("enable_singularity_check", True))
         self._runtime_require_algo_checks = bool(runtime_joint_guard.get("require_algo_checks", False))
         self._runtime_guard_fail_on_ik_error = bool(runtime_joint_guard.get("fail_on_ik_error", True))
+        ik_selection = robot_cfg.get("ik_selection", {})
+        if not isinstance(ik_selection, dict):
+            ik_selection = {}
+        ik_solver = robot_cfg.get("ik_solver", {})
+        if not isinstance(ik_solver, dict):
+            ik_solver = {}
+        self._ik_selection_cfg = dict(ik_selection)
+        self._ik_solver_cfg = dict(ik_solver)
+        self._online_ik_enabled = bool(robot_cfg.get("online_ik_enabled", True))
+        self._online_ik_allow_pose_fallback = bool(robot_cfg.get("online_ik_allow_pose_fallback", True))
+        self._online_ik_warn_only = bool(robot_cfg.get("online_ik_warn_only", False))
+        self._online_ik_log_interval = int(robot_cfg.get("online_ik_log_interval", self._progress_log_interval))
+        if self._online_ik_log_interval <= 0:
+            self._online_ik_log_interval = self._progress_log_interval
+        self._online_ik_rng = np.random.default_rng(int(self._ik_solver_cfg.get("random_seed", 42)))
+        self._last_selected_joint_deg: np.ndarray | None = None
+        self._last_target_joint_deg: np.ndarray | None = None
+        self._online_ik_warned_halfspace = False
 
         if self._workspace_clip_in_adapter and not isinstance(self._workspace_bounds_base, dict):
             raise ValueError("workspace_bounds_base must be a dict when workspace_clip_in_adapter=true")
@@ -730,6 +772,491 @@ class GermanArmAdapter(BaseRobotAdapter):
             pos[idx] = float(np.clip(pos[idx], float(axis_bounds[0]), float(axis_bounds[1])))
         return pos
 
+    def _selection_float(self, key: str, default: float) -> float:
+        value = self._ik_selection_cfg.get(key, default)
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _solver_float(self, key: str, default: float) -> float:
+        value = self._ik_solver_cfg.get(key, default)
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _solver_int(self, key: str, default: int) -> int:
+        value = self._ik_solver_cfg.get(key, default)
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    def _normalize_joint_index(self, idx_raw: Any, dof: int) -> int | None:
+        try:
+            idx = int(idx_raw)
+        except (TypeError, ValueError):
+            return None
+        if idx < 0:
+            idx += int(dof)
+        if idx < 0 or idx >= int(dof):
+            return None
+        return int(idx)
+
+    def _resolve_home_q_deg(self, dof: int, q_seed_deg: np.ndarray, q_min_deg: np.ndarray, q_max_deg: np.ndarray) -> np.ndarray:
+        home = self._ik_selection_cfg.get("home_q_deg")
+        if isinstance(home, (list, tuple)):
+            arr = np.asarray(home, dtype=np.float64).reshape(-1)
+            if arr.shape[0] >= int(dof):
+                return np.clip(arr[:dof], q_min_deg[:dof], q_max_deg[:dof])
+        return q_seed_deg[:dof].copy()
+
+    @staticmethod
+    def _joint_center_cost(q_deg: np.ndarray, q_min_deg: np.ndarray, q_max_deg: np.ndarray) -> float:
+        center = 0.5 * (q_min_deg + q_max_deg)
+        half_span = 0.5 * np.maximum(q_max_deg - q_min_deg, 1e-6)
+        normed = (np.asarray(q_deg, dtype=np.float64) - center) / half_span
+        return float(np.linalg.norm(normed) / np.sqrt(max(1, normed.shape[0])))
+
+    def _joint_range_prior_cost(self, q_deg: np.ndarray, dof: int) -> tuple[float, bool]:
+        ranges = self._ik_selection_cfg.get("joint_preferred_ranges_deg", None)
+        if not isinstance(ranges, list):
+            return 0.0, False
+        q_deg = np.asarray(q_deg, dtype=np.float64)
+        acc = 0.0
+        used = 0
+        violated = False
+        for i in range(min(int(dof), len(ranges))):
+            item = ranges[i]
+            if item is None:
+                continue
+            if isinstance(item, dict):
+                lo_deg = item.get("min_deg", item.get("min", None))
+                hi_deg = item.get("max_deg", item.get("max", None))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                lo_deg, hi_deg = item[0], item[1]
+            else:
+                continue
+            try:
+                lo = float(lo_deg)
+                hi = float(hi_deg)
+            except (TypeError, ValueError):
+                continue
+            if hi < lo:
+                lo, hi = hi, lo
+            span = max(hi - lo, 1e-6)
+            qi = float(q_deg[i])
+            if qi < lo:
+                v = (lo - qi) / span
+                violated = True
+            elif qi > hi:
+                v = (qi - hi) / span
+                violated = True
+            else:
+                v = 0.0
+            acc += v * v
+            used += 1
+        if used <= 0:
+            return 0.0, False
+        return float(acc / used), violated
+
+    def _elbow_sign_cost(self, q_deg: np.ndarray, dof: int) -> tuple[float, bool]:
+        idx = self._normalize_joint_index(self._ik_selection_cfg.get("elbow_joint_index", 2), dof=dof)
+        if idx is None:
+            return 0.0, False
+        pref = 1.0 if self._selection_float("elbow_preferred_sign", 1.0) >= 0.0 else -1.0
+        deadband_rad = max(self._selection_float("elbow_sign_deadband_rad", 0.0), 0.0)
+        signed_rad = pref * math.radians(float(np.asarray(q_deg, dtype=np.float64)[idx]))
+        if signed_rad >= deadband_rad:
+            return 0.0, False
+        viol = deadband_rad - signed_rad
+        return float((viol / np.pi) ** 2), bool(signed_rad < 0.0)
+
+    def _elbow_halfspace_cost(self) -> tuple[float, bool]:
+        # Online RM SDK path does not expose elbow-frame translation directly.
+        if self._selection_float("w_elbow_halfspace", 0.0) > 0.0 and (not self._online_ik_warned_halfspace):
+            print("[WARN] online IK: elbow half-space prior requested but elbow frame FK is unavailable in adapter.")
+            self._online_ik_warned_halfspace = True
+        return 0.0, False
+
+    def _wrist_flip_transition_cost(self, q_prev_deg: np.ndarray, q_now_deg: np.ndarray, dof: int) -> tuple[float, bool]:
+        idx_list = self._ik_selection_cfg.get("wrist_joint_indices", [-2, -1])
+        if not isinstance(idx_list, list):
+            idx_list = [idx_list]
+        step_th_rad = max(self._selection_float("wrist_flip_step_threshold_rad", 0.8), 1e-6)
+        sign_eps_rad = max(self._selection_float("wrist_flip_sign_epsilon_rad", 0.15), 0.0)
+        q_prev_deg = np.asarray(q_prev_deg, dtype=np.float64)
+        q_now_deg = np.asarray(q_now_deg, dtype=np.float64)
+        raw = 0.0
+        flagged = False
+        for idx_raw in idx_list:
+            idx = self._normalize_joint_index(idx_raw, dof=dof)
+            if idx is None:
+                continue
+            a = math.radians(float(q_prev_deg[idx]))
+            b = math.radians(float(q_now_deg[idx]))
+            dq = abs(b - a)
+            if dq > step_th_rad:
+                raw += (dq - step_th_rad) / step_th_rad
+                flagged = True
+            if abs(a) > sign_eps_rad and abs(b) > sign_eps_rad and (a * b < 0.0):
+                raw += 1.0
+                flagged = True
+        return float(raw), flagged
+
+    def _evaluate_fk_pose_error(
+        self,
+        q_deg: np.ndarray,
+        target_pos_base: np.ndarray,
+        target_rot_base: np.ndarray,
+    ) -> tuple[float, float]:
+        if self._robot is None:
+            return float("inf"), float("inf")
+        if not hasattr(self._robot, "rm_algo_forward_kinematics"):
+            return 0.0, 0.0
+        try:
+            pose_fk = self._robot.rm_algo_forward_kinematics(np.asarray(q_deg, dtype=np.float64).tolist(), 1)
+            pose_fk = np.asarray(pose_fk, dtype=np.float64).reshape(-1)
+            if pose_fk.shape[0] < 6:
+                return float("inf"), float("inf")
+            fk_pos = pose_fk[:3]
+            fk_rot = _euler_xyz_to_matrix(float(pose_fk[3]), float(pose_fk[4]), float(pose_fk[5]))
+            pos_err = float(np.linalg.norm(fk_pos - np.asarray(target_pos_base, dtype=np.float64)))
+            rot_err = _rotation_geodesic_distance(np.asarray(target_rot_base, dtype=np.float64), fk_rot)
+            return pos_err, rot_err
+        except Exception:
+            return float("inf"), float("inf")
+
+    def _singularity_metric(self, q_deg: np.ndarray, dof: int) -> float:
+        if self._robot is None:
+            return 1.0
+        if (not self._runtime_enable_singularity_check) or dof != 6:
+            return 1.0
+        if not hasattr(self._robot, "rm_algo_kin_robot_singularity_analyse"):
+            return 1.0
+        try:
+            sing_ret, sing_dist = self._robot.rm_algo_kin_robot_singularity_analyse(
+                np.asarray(q_deg, dtype=np.float64)[:6].tolist()
+            )
+            if int(sing_ret) != 0:
+                return 1e-6
+            return float(max(abs(float(sing_dist)), 1e-6))
+        except Exception:
+            return 1e-6
+
+    def _build_ik_seeds(
+        self,
+        dof: int,
+        q_curr_deg: np.ndarray,
+        q_home_deg: np.ndarray,
+        q_min_deg: np.ndarray,
+        q_max_deg: np.ndarray,
+    ) -> list[tuple[str, np.ndarray]]:
+        seeds: list[tuple[str, np.ndarray]] = []
+        seeds.append(("curr", q_curr_deg.copy()))
+        if self._last_selected_joint_deg is not None and self._last_selected_joint_deg.shape[0] >= dof:
+            seeds.append(("last", self._last_selected_joint_deg[:dof].copy()))
+        seeds.append(("home", q_home_deg.copy()))
+
+        noise_small = max(self._solver_float("seed_noise_small_deg", 2.0), 0.0)
+        noise_large = max(self._solver_float("seed_noise_large_deg", 5.0), 0.0)
+        seeds.append(
+            ("curr_noise_small", np.clip(q_curr_deg + self._online_ik_rng.normal(0.0, noise_small, size=dof), q_min_deg, q_max_deg))
+        )
+        seeds.append(
+            ("curr_noise_large", np.clip(q_curr_deg + self._online_ik_rng.normal(0.0, noise_large, size=dof), q_min_deg, q_max_deg))
+        )
+        seeds.append(
+            ("home_noise_small", np.clip(q_home_deg + self._online_ik_rng.normal(0.0, noise_small, size=dof), q_min_deg, q_max_deg))
+        )
+        seeds.append(
+            ("home_noise_large", np.clip(q_home_deg + self._online_ik_rng.normal(0.0, noise_large, size=dof), q_min_deg, q_max_deg))
+        )
+
+        n_random = max(self._solver_int("n_random_seeds", 8), 0)
+        for idx in range(n_random):
+            q_rand = self._online_ik_rng.uniform(q_min_deg, q_max_deg)
+            seeds.append((f"uniform_{idx}", q_rand))
+        return seeds
+
+    def _score_online_ik_candidate(
+        self,
+        q_cand_deg: np.ndarray,
+        q_ref_deg: np.ndarray,
+        q_home_deg: np.ndarray,
+        q_min_deg: np.ndarray,
+        q_max_deg: np.ndarray,
+        q_min_soft_deg: np.ndarray,
+        q_max_soft_deg: np.ndarray,
+        dof: int,
+        target_pos_base: np.ndarray,
+        target_rot_base: np.ndarray,
+    ) -> OnlineIKCandidate:
+        q_cand_deg = np.asarray(q_cand_deg, dtype=np.float64)[:dof].copy()
+        q_ref_deg = np.asarray(q_ref_deg, dtype=np.float64)[:dof].copy()
+        q_home_deg = np.asarray(q_home_deg, dtype=np.float64)[:dof].copy()
+        q_min_deg = np.asarray(q_min_deg, dtype=np.float64)[:dof].copy()
+        q_max_deg = np.asarray(q_max_deg, dtype=np.float64)[:dof].copy()
+        q_min_soft_deg = np.asarray(q_min_soft_deg, dtype=np.float64)[:dof].copy()
+        q_max_soft_deg = np.asarray(q_max_soft_deg, dtype=np.float64)[:dof].copy()
+
+        pos_err_m, rot_err_rad = self._evaluate_fk_pose_error(q_cand_deg, target_pos_base, target_rot_base)
+        margin_deg = float(np.min(np.minimum(q_cand_deg - q_min_deg, q_max_deg - q_cand_deg)))
+        margin_rad = math.radians(max(margin_deg, 0.0))
+        singular_metric = self._singularity_metric(q_cand_deg, dof=dof)
+
+        dq_rad = np.deg2rad(q_cand_deg - q_ref_deg)
+        transition_l2 = float(np.linalg.norm(dq_rad))
+        transition_linf = float(np.max(np.abs(dq_rad)))
+        branch_jump = transition_linf > self._selection_float("branch_jump_rad", 0.6)
+        hard_max_step_rad = max(self._selection_float("hard_max_step_rad", 0.0), 0.0)
+        hard_step_violation = bool(hard_max_step_rad > 0.0 and transition_linf > hard_max_step_rad)
+
+        wrist_flip_raw, wrist_flip_flag = self._wrist_flip_transition_cost(q_ref_deg, q_cand_deg, dof=dof)
+        shape_cost, _ = self._joint_range_prior_cost(q_cand_deg, dof=dof)
+        elbow_sign_cost, _ = self._elbow_sign_cost(q_cand_deg, dof=dof)
+        elbow_halfspace_cost, _ = self._elbow_halfspace_cost()
+        center_cost = self._joint_center_cost(q_cand_deg, q_min_deg, q_max_deg)
+        home_dist_rad = float(np.linalg.norm(np.deg2rad(q_cand_deg - q_home_deg)))
+
+        total = 0.0
+        total += self._selection_float("w_local_pos", 1.0) * pos_err_m
+        total += self._selection_float("w_local_rot", 0.4) * rot_err_rad
+        total += self._selection_float("w_local_limit", 0.01) / (margin_rad + 1e-6)
+        total += self._selection_float("w_local_sing", 0.01) / (singular_metric + 1e-6)
+        total += self._selection_float("w_local_center", 0.0) * center_cost
+        total += self._selection_float("w_shape_joint_range", 0.0) * shape_cost
+        total += self._selection_float("w_elbow_sign", 0.0) * elbow_sign_cost
+        total += self._selection_float("w_elbow_halfspace", 0.0) * elbow_halfspace_cost
+
+        w_home = self._selection_float("w_home", 0.0)
+        w_start_home = self._selection_float("w_start_home", 0.0)
+        start_home_window = max(int(self._ik_selection_cfg.get("start_home_window", 0)), 0)
+        total += w_home * home_dist_rad
+        if start_home_window > 0 and self._action_counter < start_home_window:
+            alpha = float(start_home_window - self._action_counter) / float(start_home_window)
+            total += w_start_home * alpha * home_dist_rad
+
+        w_transition_l2 = self._selection_float("w_transition_l2", self._selection_float("w_transition_smooth", 0.3))
+        w_transition_linf = self._selection_float("w_transition_linf", 0.0)
+        total += w_transition_l2 * transition_l2
+        total += w_transition_linf * transition_linf
+
+        if branch_jump or wrist_flip_flag:
+            total += self._selection_float("branch_penalty", 2.0)
+        total += self._selection_float("w_wrist_flip", 0.0) * wrist_flip_raw
+
+        if hard_step_violation:
+            excess = transition_linf - hard_max_step_rad
+            total += self._selection_float("hard_step_penalty", 200.0) * (1.0 + excess / max(hard_max_step_rad, 1e-6))
+
+        pos_tol_m = max(self._solver_float("pos_tol_m", 0.008), 1e-6)
+        rot_tol_rad = max(math.radians(self._solver_float("rot_tol_deg", 8.0)), 1e-6)
+        if (pos_err_m > pos_tol_m) or (rot_err_rad > rot_tol_rad):
+            total += self._selection_float("failed_candidate_penalty", 20.0)
+
+        safety_ok, safety_issues = _check_joint_safety(
+            self._robot,
+            q_cand_deg,
+            q_min_soft_deg,
+            q_max_soft_deg,
+            dof,
+            enable_self_collision_check=self._runtime_enable_self_collision_check,
+            enable_singularity_check=False,
+            require_algo_checks=self._runtime_require_algo_checks,
+        )
+        if not safety_ok:
+            total += self._selection_float("failed_candidate_penalty", 20.0) + 2.0 * float(len(safety_issues))
+
+        return OnlineIKCandidate(
+            q_deg=q_cand_deg,
+            source="",
+            total_cost=float(total),
+            pos_err_m=float(pos_err_m),
+            rot_err_rad=float(rot_err_rad),
+            limit_margin_deg=float(margin_deg),
+            singular_metric=float(singular_metric),
+            transition_l2_rad=float(transition_l2),
+            transition_linf_rad=float(transition_linf),
+            wrist_flip_raw=float(wrist_flip_raw),
+            branch_jump=bool(branch_jump),
+            hard_step_violation=bool(hard_step_violation),
+            shape_cost=float(shape_cost),
+            elbow_sign_cost=float(elbow_sign_cost),
+            elbow_halfspace_cost=float(elbow_halfspace_cost),
+            home_dist_rad=float(home_dist_rad),
+            center_cost=float(center_cost),
+            safety_ok=bool(safety_ok),
+            safety_issues=list(safety_issues),
+        )
+
+    def _select_joint_target_with_online_ik(
+        self,
+        pose_base_xyzrpy: list[float],
+        target_pos_base: np.ndarray,
+        target_rot_base: np.ndarray,
+    ) -> tuple[np.ndarray, OnlineIKCandidate]:
+        if self._robot is None or self._rm_module is None:
+            raise RuntimeError("online IK selection requires RM robot + RM module")
+        raw_joint = np.asarray(self._robot.rm_get_joint_degree()[1], dtype=np.float64).reshape(-1)
+        if raw_joint.size <= 0:
+            raise RuntimeError("rm_get_joint_degree returned empty list")
+        dof = min(_safe_dof(self._robot, fallback=int(raw_joint.size)), int(raw_joint.size))
+        q_curr_deg = _read_joint_degree(self._robot, dof)
+        q_ref_deg = q_curr_deg.copy()
+        if self._last_selected_joint_deg is not None and self._last_selected_joint_deg.shape[0] >= dof:
+            q_ref_deg = self._last_selected_joint_deg[:dof].copy()
+        q_min_deg, q_max_deg = _read_joint_limits(self._robot, dof)
+        margin = float(max(self._runtime_joint_limit_margin_deg, 0.0))
+        q_min_soft_deg = q_min_deg + margin
+        q_max_soft_deg = q_max_deg - margin
+        if np.any(q_min_soft_deg >= q_max_soft_deg):
+            q_min_soft_deg = q_min_deg.copy()
+            q_max_soft_deg = q_max_deg.copy()
+        q_home_deg = self._resolve_home_q_deg(dof, q_curr_deg, q_min_deg, q_max_deg)
+
+        seeds = self._build_ik_seeds(dof, q_curr_deg, q_home_deg, q_min_deg, q_max_deg)
+        dedup_tol_deg = max(math.degrees(self._solver_float("dedup_joint_tol_rad", 0.02)), 1e-6)
+        max_candidates = max(self._solver_int("max_candidates_per_frame", 12), 1)
+
+        candidates: list[OnlineIKCandidate] = []
+        for source, seed in seeds:
+            ik_params = self._rm_module.rm_inverse_kinematics_params_t(
+                q_in=_to_len7_joint(seed, dof),
+                q_pose=[float(x) for x in pose_base_xyzrpy],
+                flag=1,
+            )
+            ik_ret, q_target_raw = self._robot.rm_algo_inverse_kinematics(ik_params)
+            if int(ik_ret) != 0:
+                continue
+            q_target_raw = np.asarray(q_target_raw, dtype=np.float64).reshape(-1)
+            if q_target_raw.size < dof:
+                continue
+            q_cand = np.clip(q_target_raw[:dof].copy(), q_min_deg, q_max_deg)
+            duplicated = any(float(np.max(np.abs(ref.q_deg - q_cand))) <= dedup_tol_deg for ref in candidates)
+            if duplicated:
+                continue
+            cand = self._score_online_ik_candidate(
+                q_cand_deg=q_cand,
+                q_ref_deg=q_ref_deg,
+                q_home_deg=q_home_deg,
+                q_min_deg=q_min_deg,
+                q_max_deg=q_max_deg,
+                q_min_soft_deg=q_min_soft_deg,
+                q_max_soft_deg=q_max_soft_deg,
+                dof=dof,
+                target_pos_base=target_pos_base,
+                target_rot_base=target_rot_base,
+            )
+            cand.source = source
+            candidates.append(cand)
+
+        if not candidates:
+            raise RuntimeError("online IK selection failed: no feasible candidate from RM IK seeds")
+
+        candidates.sort(key=lambda x: x.total_cost)
+        best = candidates[:max_candidates][0]
+        self._last_selected_joint_deg = best.q_deg.copy()
+        self._last_target_joint_deg = best.q_deg.copy()
+
+        if self._action_counter <= 5 or (self._action_counter % self._online_ik_log_interval == 0):
+            print(
+                f"[IK {self._action_counter}] cands={len(candidates)} best={best.source} "
+                f"cost={best.total_cost:.4f} pos_err={best.pos_err_m:.4f} rot_err={best.rot_err_rad:.4f} "
+                f"step={best.transition_linf_rad:.4f}rad margin={best.limit_margin_deg:.2f}deg "
+                f"wrist_raw={best.wrist_flip_raw:.3f} branch={int(best.branch_jump)} "
+                f"hard_step={int(best.hard_step_violation)} safety={int(best.safety_ok)}"
+            )
+            if not best.safety_ok:
+                print(f"[IK {self._action_counter}] safety_issues={best.safety_issues}")
+
+        return best.q_deg.copy(), best
+
+    def _send_joint_target_movej(self, q_target_deg: np.ndarray) -> None:
+        if self._robot is None:
+            raise RuntimeError("Robot handle is not initialized")
+        speed = int(np.clip(int(self.robot_cfg.get("movej_speed", self.robot_cfg.get("movep_canfd_speed", 30))), 1, 100))
+        blend = int(np.clip(int(self.robot_cfg.get("movej_blend", 0)), 0, 100))
+        block = int(self.robot_cfg.get("movej_block", 0))
+        connect = 0
+        if self._trajectory_enum is not None:
+            try:
+                connect = int(self._trajectory_enum.RM_TRAJECTORY_DISCONNECT_E)
+            except Exception:
+                connect = 0
+        ret = self._robot.rm_movej(np.asarray(q_target_deg, dtype=np.float64).tolist(), speed, blend, connect, block)
+        if int(ret) != 0:
+            raise RuntimeError(f"rm_movej failed: code={ret}")
+
+    def _send_pose_fallback(self, pose_base_xyzrpy: list[float]) -> None:
+        if self._robot is None:
+            raise RuntimeError("Robot handle is not initialized")
+        speed = int(self.robot_cfg.get("movep_canfd_speed", 50))
+        follow = bool(self.robot_cfg.get("movep_canfd_follow", False))
+        trajectory_mode = int(self.robot_cfg.get("movep_canfd_trajectory_mode", 0))
+        smooth_param = int(self.robot_cfg.get("movep_canfd_radio", 0))
+        ret = self._robot.rm_movep_canfd(
+            pose_base_xyzrpy,
+            follow,
+            trajectory_mode=trajectory_mode,
+            radio=smooth_param,
+        )
+        if ret != 0:
+            connect = 0
+            if self._trajectory_enum is not None:
+                try:
+                    connect = int(self._trajectory_enum.RM_TRAJECTORY_DISCONNECT_E)
+                except Exception:
+                    connect = 0
+            ret = self._robot.rm_movej_p(pose_base_xyzrpy, speed, 0, connect, 0)
+            if ret != 0:
+                raise RuntimeError(f"send_action failed in fallback path: rm_movep_canfd={ret}")
+
+    def _runtime_precheck_target_joint(self, q_target_deg: np.ndarray) -> None:
+        if (not self._runtime_joint_guard_enabled) or self._robot is None:
+            return
+        issues: list[str] = []
+        try:
+            q_target_deg = np.asarray(q_target_deg, dtype=np.float64).reshape(-1)
+            if q_target_deg.size <= 0:
+                raise RuntimeError("empty target joint")
+            dof = int(q_target_deg.shape[0])
+            q_seed = _read_joint_degree(self._robot, dof)
+            q_min, q_max = _read_joint_limits(self._robot, dof)
+            margin = float(max(self._runtime_joint_limit_margin_deg, 0.0))
+            q_min_soft = q_min + margin
+            q_max_soft = q_max - margin
+            if np.any(q_min_soft >= q_max_soft):
+                q_min_soft = q_min.copy()
+                q_max_soft = q_max.copy()
+            ok, safety_issues = _check_joint_safety(
+                self._robot,
+                q_target_deg[:dof].copy(),
+                q_min_soft,
+                q_max_soft,
+                dof,
+                enable_self_collision_check=self._runtime_enable_self_collision_check,
+                enable_singularity_check=self._runtime_enable_singularity_check,
+                require_algo_checks=self._runtime_require_algo_checks,
+            )
+            if not ok:
+                issues.extend(safety_issues)
+            max_step = float(np.max(np.abs(q_target_deg[:dof] - q_seed[:dof])))
+            if max_step > float(self._runtime_joint_max_step_deg):
+                issues.append(
+                    f"joint_step_too_large:max={max_step:.3f}deg,limit={self._runtime_joint_max_step_deg:.3f}deg"
+                )
+        except Exception as exc:
+            issues.append(f"runtime_joint_guard_exception={exc}")
+
+        if issues:
+            msg = "runtime joint guard blocked action: " + "; ".join(issues)
+            if self._runtime_joint_guard_warn_only:
+                print(f"[WARN] {msg}")
+                return
+            raise RuntimeError(msg)
+
     def _runtime_precheck_target_pose(self, pose_base_xyzrpy: list[float]) -> None:
         if (not self._runtime_joint_guard_enabled) or self._robot is None:
             return
@@ -831,6 +1358,15 @@ class GermanArmAdapter(BaseRobotAdapter):
             _, _, pose6 = self._read_current_pose_base()
             self._last_target_pose = pose6.copy()
             self._last_target_pose_base = pose6.copy()
+            try:
+                raw_joint = np.asarray(self._robot.rm_get_joint_degree()[1], dtype=np.float64).reshape(-1)
+                if raw_joint.size > 0:
+                    dof = min(_safe_dof(self._robot, fallback=int(raw_joint.size)), int(raw_joint.size))
+                    self._last_selected_joint_deg = raw_joint[:dof].copy()
+                    self._last_target_joint_deg = raw_joint[:dof].copy()
+            except Exception:
+                self._last_selected_joint_deg = None
+                self._last_target_joint_deg = None
             t_b_rpy = matrix_to_rpy_xyz(self._frame_chain.R_B_from_M)
             t_f_rpy = matrix_to_rpy_xyz(self._frame_chain.R_T_from_F)
             print(
@@ -861,6 +1397,12 @@ class GermanArmAdapter(BaseRobotAdapter):
                     f"margin_deg={self._runtime_joint_limit_margin_deg:.2f}, "
                     f"max_joint_step_deg={self._runtime_joint_max_step_deg:.2f}"
                 )
+            print(
+                "[INFO] online_ik_selection: "
+                f"enabled={int(self._online_ik_enabled)}, "
+                f"pose_fallback={int(self._online_ik_allow_pose_fallback)}, "
+                f"warn_only={int(self._online_ik_warn_only)}"
+            )
             self._connect_camera()
         except Exception:
             try:
@@ -879,6 +1421,8 @@ class GermanArmAdapter(BaseRobotAdapter):
         self._connected_tool_frame_name = None
         self._last_target_pose = None
         self._last_target_pose_base = None
+        self._last_selected_joint_deg = None
+        self._last_target_joint_deg = None
         if not self.connected or self._robot is None:
             return
         self._robot.rm_delete_robot_arm()
@@ -979,23 +1523,29 @@ class GermanArmAdapter(BaseRobotAdapter):
                 f"base_flange_xyz={pos_base_flange.round(4).tolist()} "
                 f"cmd_{self._sdk_pose_represents}_xyz={pos_base_cmd.round(4).tolist()}"
             )
-        self._runtime_precheck_target_pose(pose)
         self._last_target_pose = np.array(pose, dtype=np.float64)
         self._last_target_pose_base = self._last_target_pose.copy()
+        online_exc: Exception | None = None
+        if self._online_ik_enabled:
+            try:
+                q_target_deg, _ = self._select_joint_target_with_online_ik(
+                    pose_base_xyzrpy=pose,
+                    target_pos_base=pos_base_cmd,
+                    target_rot_base=rot_base_cmd,
+                )
+                self._runtime_precheck_target_joint(q_target_deg)
+                self._send_joint_target_movej(q_target_deg)
+            except Exception as exc:
+                online_exc = exc
 
-        speed = int(self.robot_cfg.get("movep_canfd_speed", 50))
-        follow = bool(self.robot_cfg.get("movep_canfd_follow", False))
-        trajectory_mode = int(self.robot_cfg.get("movep_canfd_trajectory_mode", 0))
-        smooth_param = int(self.robot_cfg.get("movep_canfd_radio", 0))
-
-        # The wrapper exposes pose pass-through through CANFD for low-latency control.
-        ret = self._robot.rm_movep_canfd(pose, follow, trajectory_mode=trajectory_mode, radio=smooth_param)
-        if ret != 0:
-            # Fallback to non-blocking movej_p if pass-through temporarily fails.
-            connect = int(self._trajectory_enum.RM_TRAJECTORY_DISCONNECT_E)
-            ret = self._robot.rm_movej_p(pose, speed, 0, connect, 0)
-            if ret != 0:
-                raise RuntimeError(f"send_action failed: rm_movep_canfd={ret}")
+        if (not self._online_ik_enabled) or (online_exc is not None):
+            if online_exc is not None:
+                use_fallback = bool(self._online_ik_allow_pose_fallback or self._online_ik_warn_only)
+                if not use_fallback:
+                    raise RuntimeError(f"online IK selection failed: {online_exc}") from online_exc
+                print(f"[WARN] online IK failed, fallback to pose path: {online_exc}")
+            self._runtime_precheck_target_pose(pose)
+            self._send_pose_fallback(pose)
 
         gripper = float(action.get("gripper", self._last_gripper))
         if self._disable_gripper_control:
