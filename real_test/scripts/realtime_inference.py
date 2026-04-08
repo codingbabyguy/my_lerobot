@@ -330,7 +330,7 @@ def _map_state_policy_to_adapter(
     return out
 
 
-def _load_startup_q_selected(cfg: dict, dof: int) -> tuple[np.ndarray, str, int]:
+def _load_startup_q_selected(cfg: dict, dof: int) -> tuple[np.ndarray, str, int, str]:
     startup_cfg = cfg.get("startup_pose", {})
     if not isinstance(startup_cfg, dict):
         startup_cfg = {}
@@ -367,7 +367,25 @@ def _load_startup_q_selected(cfg: dict, dof: int) -> tuple[np.ndarray, str, int]
         raise ValueError(
             f"q_selected[{q_index}] length mismatch: {row.shape[0]} < dof({dof}) in {npz_file}"
         )
-    return row[:dof].copy(), str(npz_file), int(q_index)
+    q_row = row[:dof].copy()
+
+    unit_cfg = str(startup_cfg.get("q_selected_unit", "auto")).strip().lower()
+    if unit_cfg not in {"auto", "rad", "deg"}:
+        raise ValueError("startup_pose.q_selected_unit must be one of: auto, rad, deg")
+    if unit_cfg == "auto":
+        # Heuristic: rad trajectories are usually within roughly [-2pi, 2pi].
+        max_abs = float(np.max(np.abs(q_row)))
+        inferred = "rad" if max_abs <= 8.0 else "deg"
+    else:
+        inferred = unit_cfg
+
+    if inferred == "rad":
+        q_row = np.rad2deg(q_row)
+
+    if bool(startup_cfg.get("wrap_q_deg_to_180", False)):
+        q_row = ((q_row + 180.0) % 360.0) - 180.0
+
+    return q_row.copy(), str(npz_file), int(q_index), inferred
 
 
 def _move_to_startup_state_joint(
@@ -395,8 +413,8 @@ def _move_to_startup_state_joint(
     if np.any(q_min_soft >= q_max_soft):
         q_min_soft = q_min.copy()
         q_max_soft = q_max.copy()
-    q1, npz_file, q_index = _load_startup_q_selected(cfg=cfg, dof=dof)
-    print(f"[STARTUP] joint target source={npz_file} q_selected[{q_index}]")
+    q1, npz_file, q_index, q_unit = _load_startup_q_selected(cfg=cfg, dof=dof)
+    print(f"[STARTUP] joint target source={npz_file} q_selected[{q_index}] unit={q_unit}->deg")
     print(f"[STARTUP] joint q_target(deg)={q1.tolist()}")
 
     ok_target, target_issues = _check_joint_safety(
