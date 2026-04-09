@@ -12,6 +12,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -330,7 +331,7 @@ def _map_state_policy_to_adapter(
     return out
 
 
-def _load_startup_q_selected(cfg: dict, dof: int) -> tuple[np.ndarray, str, int, str]:
+def _load_startup_q_selected_matrix(cfg: dict, dof: int) -> tuple[np.ndarray, str, str]:
     startup_cfg = cfg.get("startup_pose", {})
     if not isinstance(startup_cfg, dict):
         startup_cfg = {}
@@ -355,37 +356,108 @@ def _load_startup_q_selected(cfg: dict, dof: int) -> tuple[np.ndarray, str, int,
         raise ValueError(
             f"invalid q_selected shape in {npz_file}: expected [N,dof], got {q_selected.shape}"
         )
-    q_index = int(startup_cfg.get("q_index", 0))
-    if q_index < 0:
-        q_index += int(q_selected.shape[0])
-    if q_index < 0 or q_index >= int(q_selected.shape[0]):
-        raise IndexError(
-            f"startup q_index out of range: q_index={q_index}, num_rows={int(q_selected.shape[0])}"
-        )
-    row = np.asarray(q_selected[q_index], dtype=np.float64).reshape(-1)
-    if row.shape[0] < dof:
+    if int(q_selected.shape[1]) < int(dof):
         raise ValueError(
-            f"q_selected[{q_index}] length mismatch: {row.shape[0]} < dof({dof}) in {npz_file}"
+            f"q_selected width mismatch: {int(q_selected.shape[1])} < dof({dof}) in {npz_file}"
         )
-    q_row = row[:dof].copy()
+    q_mat = np.asarray(q_selected[:, :dof], dtype=np.float64).copy()
 
     unit_cfg = str(startup_cfg.get("q_selected_unit", "auto")).strip().lower()
     if unit_cfg not in {"auto", "rad", "deg"}:
         raise ValueError("startup_pose.q_selected_unit must be one of: auto, rad, deg")
     if unit_cfg == "auto":
         # Heuristic: rad trajectories are usually within roughly [-2pi, 2pi].
-        max_abs = float(np.max(np.abs(q_row)))
+        max_abs = float(np.max(np.abs(q_mat)))
         inferred = "rad" if max_abs <= 8.0 else "deg"
     else:
         inferred = unit_cfg
 
     if inferred == "rad":
-        q_row = np.rad2deg(q_row)
+        q_mat = np.rad2deg(q_mat)
 
     if bool(startup_cfg.get("wrap_q_deg_to_180", False)):
-        q_row = ((q_row + 180.0) % 360.0) - 180.0
+        q_mat = ((q_mat + 180.0) % 360.0) - 180.0
 
-    return q_row.copy(), str(npz_file), int(q_index), inferred
+    return q_mat.copy(), str(npz_file), inferred
+
+
+def _select_startup_q_from_scan(
+    cfg: dict,
+    dof: int,
+    q_current_deg: np.ndarray,
+    q_min_soft_deg: np.ndarray,
+    q_max_soft_deg: np.ndarray,
+    robot: Any,
+) -> tuple[np.ndarray, int, int, str]:
+    startup_cfg = cfg.get("startup_pose", {})
+    if not isinstance(startup_cfg, dict):
+        startup_cfg = {}
+
+    q_mat_deg, npz_file, inferred_unit = _load_startup_q_selected_matrix(cfg=cfg, dof=dof)
+    total_rows = int(q_mat_deg.shape[0])
+    scan_first_n = int(startup_cfg.get("scan_first_n", 60))
+    scan_first_n = max(1, min(scan_first_n, total_rows))
+    scan_start = int(startup_cfg.get("scan_start_index", 0))
+    if scan_start < 0:
+        scan_start += total_rows
+    scan_start = int(np.clip(scan_start, 0, max(total_rows - 1, 0)))
+    scan_end = min(total_rows, scan_start + scan_first_n)
+    max_candidate_delta_deg = float(startup_cfg.get("max_startup_candidate_delta_deg", 35.0))
+    if max_candidate_delta_deg <= 0.0:
+        max_candidate_delta_deg = 35.0
+
+    enable_self_collision = not bool(startup_cfg.get("disable_self_collision_check", False))
+    enable_singularity = not bool(startup_cfg.get("disable_singularity_check", False))
+    require_algo_checks = bool(startup_cfg.get("require_algo_checks", True))
+
+    best_idx = -1
+    best_q: np.ndarray | None = None
+    rejected_limit = 0
+    rejected_sing = 0
+    rejected_step = 0
+    rejected_other = 0
+
+    for i in range(scan_start, scan_end):
+        q_i = np.asarray(q_mat_deg[i], dtype=np.float64).reshape(-1)[:dof].copy()
+        max_delta = float(np.max(np.abs(q_i - q_current_deg[:dof])))
+        if max_delta > max_candidate_delta_deg:
+            rejected_step += 1
+            continue
+
+        ok, issues = _check_joint_safety(
+            robot,
+            q_i,
+            q_min_soft_deg,
+            q_max_soft_deg,
+            dof,
+            enable_self_collision_check=enable_self_collision,
+            enable_singularity_check=enable_singularity,
+            require_algo_checks=require_algo_checks,
+        )
+        if not ok:
+            issue_s = ";".join(issues)
+            if "joint_limit_soft_violation" in issue_s:
+                rejected_limit += 1
+            elif "singularity_detected" in issue_s:
+                rejected_sing += 1
+            else:
+                rejected_other += 1
+            continue
+
+        best_idx = int(i)
+        best_q = q_i.copy()
+        break
+
+    if best_q is None:
+        raise RuntimeError(
+            "No startup q found in selected_trajectory scan. "
+            f"file={npz_file}, rows={total_rows}, scan=[{scan_start},{scan_end}), "
+            f"max_startup_candidate_delta_deg={max_candidate_delta_deg}, "
+            f"rejected(step={rejected_step},limit={rejected_limit},sing={rejected_sing},other={rejected_other}). "
+            "Try increasing scan_first_n / max_startup_candidate_delta_deg or regenerate trajectory."
+        )
+
+    return best_q, best_idx, total_rows, inferred_unit
 
 
 def _move_to_startup_state_joint(
@@ -413,9 +485,21 @@ def _move_to_startup_state_joint(
     if np.any(q_min_soft >= q_max_soft):
         q_min_soft = q_min.copy()
         q_max_soft = q_max.copy()
-    q1, npz_file, q_index, q_unit = _load_startup_q_selected(cfg=cfg, dof=dof)
-    print(f"[STARTUP] joint target source={npz_file} q_selected[{q_index}] unit={q_unit}->deg")
-    print(f"[STARTUP] joint q_target(deg)={q1.tolist()}")
+    q1, q_index, total_rows, q_unit = _select_startup_q_from_scan(
+        cfg=cfg,
+        dof=dof,
+        q_current_deg=q0,
+        q_min_soft_deg=q_min_soft,
+        q_max_soft_deg=q_max_soft,
+        robot=robot,
+    )
+    startup_npz = str(Path(startup_cfg.get("selected_trajectory_npz", "")).expanduser().resolve())
+    print(
+        f"[STARTUP] joint target source={startup_npz} "
+        f"scan_hit=q_selected[{q_index}]/{total_rows} unit={q_unit}->deg"
+    )
+    print(f"[STARTUP] current q(deg)={q0.tolist()}")
+    print(f"[STARTUP] target  q(deg)={q1.tolist()}")
 
     ok_target, target_issues = _check_joint_safety(
         robot,

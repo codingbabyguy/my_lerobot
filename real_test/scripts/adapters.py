@@ -196,6 +196,7 @@ class OnlineIKCandidate:
     shape_cost: float = 0.0
     elbow_sign_cost: float = 0.0
     elbow_halfspace_cost: float = 0.0
+    joint3_strict_cost: float = 0.0
     home_dist_rad: float = 0.0
     center_cost: float = 0.0
     safety_ok: bool = True
@@ -880,6 +881,61 @@ class GermanArmAdapter(BaseRobotAdapter):
             self._online_ik_warned_halfspace = True
         return 0.0, False
 
+    def _joint3_strict_cost(self, q_deg: np.ndarray, q_home_deg: np.ndarray, dof: int) -> tuple[float, bool]:
+        idx = self._normalize_joint_index(self._ik_selection_cfg.get("joint3_index", 2), dof=dof)
+        if idx is None:
+            return 0.0, False
+        q_deg = np.asarray(q_deg, dtype=np.float64)
+        q_home_deg = np.asarray(q_home_deg, dtype=np.float64)
+        q3 = float(q_deg[idx])
+        h3 = float(q_home_deg[idx])
+
+        # Tight preferred range for joint3
+        strict_range = self._ik_selection_cfg.get("joint3_strict_range_deg", None)
+        lo_deg = None
+        hi_deg = None
+        if isinstance(strict_range, dict):
+            lo_deg = strict_range.get("min_deg", strict_range.get("min", None))
+            hi_deg = strict_range.get("max_deg", strict_range.get("max", None))
+        elif isinstance(strict_range, (list, tuple)) and len(strict_range) >= 2:
+            lo_deg, hi_deg = strict_range[0], strict_range[1]
+        if lo_deg is None or hi_deg is None:
+            ranges = self._ik_selection_cfg.get("joint_preferred_ranges_deg", None)
+            if isinstance(ranges, list) and idx < len(ranges):
+                item = ranges[idx]
+                if isinstance(item, dict):
+                    lo_deg = item.get("min_deg", item.get("min", None))
+                    hi_deg = item.get("max_deg", item.get("max", None))
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    lo_deg, hi_deg = item[0], item[1]
+
+        range_cost = 0.0
+        range_bad = False
+        if lo_deg is not None and hi_deg is not None:
+            lo = float(lo_deg)
+            hi = float(hi_deg)
+            if hi < lo:
+                lo, hi = hi, lo
+            span = max(hi - lo, 1e-6)
+            if q3 < lo:
+                range_cost = ((lo - q3) / span) ** 2
+                range_bad = True
+            elif q3 > hi:
+                range_cost = ((q3 - hi) / span) ** 2
+                range_bad = True
+
+        # Distance-to-home with deadband
+        deadband = max(self._selection_float("joint3_home_deadband_deg", 0.0), 0.0)
+        scale = max(self._selection_float("joint3_home_scale_deg", 20.0), 1e-6)
+        err = abs(q3 - h3)
+        home_cost = 0.0
+        home_bad = False
+        if err > deadband:
+            home_cost = ((err - deadband) / scale) ** 2
+            home_bad = True
+
+        return float(range_cost + home_cost), bool(range_bad or home_bad)
+
     def _wrist_flip_transition_cost(self, q_prev_deg: np.ndarray, q_now_deg: np.ndarray, dof: int) -> tuple[float, bool]:
         idx_list = self._ik_selection_cfg.get("wrist_joint_indices", [-2, -1])
         if not isinstance(idx_list, list):
@@ -1017,6 +1073,7 @@ class GermanArmAdapter(BaseRobotAdapter):
         shape_cost, _ = self._joint_range_prior_cost(q_cand_deg, dof=dof)
         elbow_sign_cost, _ = self._elbow_sign_cost(q_cand_deg, dof=dof)
         elbow_halfspace_cost, _ = self._elbow_halfspace_cost()
+        joint3_strict_cost, _ = self._joint3_strict_cost(q_cand_deg, q_home_deg, dof=dof)
         center_cost = self._joint_center_cost(q_cand_deg, q_min_deg, q_max_deg)
         home_dist_rad = float(np.linalg.norm(np.deg2rad(q_cand_deg - q_home_deg)))
 
@@ -1029,14 +1086,17 @@ class GermanArmAdapter(BaseRobotAdapter):
         total += self._selection_float("w_shape_joint_range", 0.0) * shape_cost
         total += self._selection_float("w_elbow_sign", 0.0) * elbow_sign_cost
         total += self._selection_float("w_elbow_halfspace", 0.0) * elbow_halfspace_cost
+        total += self._selection_float("w_joint3_strict", 0.0) * joint3_strict_cost
 
         w_home = self._selection_float("w_home", 0.0)
         w_start_home = self._selection_float("w_start_home", 0.0)
+        home_quad_gain = self._selection_float("home_quadratic_gain", 1.0)
+        home_term = home_dist_rad + home_quad_gain * home_dist_rad * home_dist_rad
         start_home_window = max(int(self._ik_selection_cfg.get("start_home_window", 0)), 0)
-        total += w_home * home_dist_rad
+        total += w_home * home_term
         if start_home_window > 0 and self._action_counter < start_home_window:
             alpha = float(start_home_window - self._action_counter) / float(start_home_window)
-            total += w_start_home * alpha * home_dist_rad
+            total += w_start_home * alpha * home_term
 
         w_transition_l2 = self._selection_float("w_transition_l2", self._selection_float("w_transition_smooth", 0.3))
         w_transition_linf = self._selection_float("w_transition_linf", 0.0)
@@ -1085,6 +1145,7 @@ class GermanArmAdapter(BaseRobotAdapter):
             shape_cost=float(shape_cost),
             elbow_sign_cost=float(elbow_sign_cost),
             elbow_halfspace_cost=float(elbow_halfspace_cost),
+            joint3_strict_cost=float(joint3_strict_cost),
             home_dist_rad=float(home_dist_rad),
             center_cost=float(center_cost),
             safety_ok=bool(safety_ok),
@@ -1165,7 +1226,7 @@ class GermanArmAdapter(BaseRobotAdapter):
                 f"[IK {self._action_counter}] cands={len(candidates)} best={best.source} "
                 f"cost={best.total_cost:.4f} pos_err={best.pos_err_m:.4f} rot_err={best.rot_err_rad:.4f} "
                 f"step={best.transition_linf_rad:.4f}rad margin={best.limit_margin_deg:.2f}deg "
-                f"wrist_raw={best.wrist_flip_raw:.3f} branch={int(best.branch_jump)} "
+                f"wrist_raw={best.wrist_flip_raw:.3f} j3_strict={best.joint3_strict_cost:.3f} branch={int(best.branch_jump)} "
                 f"hard_step={int(best.hard_step_violation)} safety={int(best.safety_ok)}"
             )
             if not best.safety_ok:
